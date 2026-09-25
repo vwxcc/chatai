@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -141,6 +141,14 @@ def init_db() -> None:
             routing_set_id INTEGER,
             updated_at TEXT NOT NULL,
             FOREIGN KEY (routing_set_id) REFERENCES routing_sets(id) ON DELETE SET NULL
+        );
+        CREATE TABLE IF NOT EXISTS chat_suggestions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            suggestions_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_chats_user_updated ON chats(user_id,updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_messages_chat_created ON messages(chat_id,created_at);
@@ -279,6 +287,70 @@ class ModelRouter:
 
 MODEL_ROUTER=ModelRouter()
 
+def _safe_title_context(messages):
+    compact=[]
+    for row in messages[-6:]:
+        content=str(row.get("content","")).strip()
+        if len(content)>1200:
+            content=content[:1200]+"…"
+        compact.append({"role":row.get("role","user"),"content":content})
+    return compact
+
+def _parse_suggestions(raw: str):
+    text=raw.strip()
+    try:
+        value=json.loads(text)
+        if isinstance(value,dict):
+            value=value.get("suggestions",[])
+        if isinstance(value,list):
+            items=[str(x).strip() for x in value if str(x).strip()]
+            if items:
+                return items[:5]
+    except Exception:
+        pass
+    items=[]
+    for line in text.splitlines():
+        line=line.strip().lstrip("-•*0123456789.) ").strip()
+        if line:
+            items.append(line)
+    return items[:5]
+
+def _run_post_response_tasks(chat_id:int, user_id:int):
+    try:
+        with closing(get_db()) as db:
+            chat=get_owned_chat(db,chat_id,user_id)
+            rows=db.execute("SELECT role,content FROM messages WHERE chat_id=? ORDER BY created_at ASC,id ASC",(chat_id,)).fetchall()
+            messages=[{"role":row["role"],"content":row["content"]} for row in rows]
+
+        if chat["title"].strip() == "Новый чат":
+            title_messages=[
+                {"role":"system","content":"Придумай короткое точное название для чата на русском языке. Верни только название, без кавычек и пояснений. Максимум 80 символов."},
+                {"role":"user","content":json.dumps(_safe_title_context(messages),ensure_ascii=False)}
+            ]
+            title_result=MODEL_ROUTER.generate("title_generation",title_messages)
+            title=title_result["content"].strip().replace("\n"," ")
+            title=title.strip('"«»')[:80].strip()
+            if title:
+                with closing(get_db()) as db:
+                    db.execute("UPDATE chats SET title=?,updated_at=? WHERE id=? AND user_id=? AND title='Новый чат'",(title,now_iso(),chat_id,user_id))
+                    db.commit()
+
+        suggestion_messages=[
+            {"role":"system","content":"Предложи 3-5 коротких полезных продолжений текущего диалога на русском языке. Верни строго JSON-массив строк без markdown и пояснений."},
+            {"role":"user","content":json.dumps(_safe_title_context(messages),ensure_ascii=False)}
+        ]
+        suggestion_result=MODEL_ROUTER.generate("suggestions_generation",suggestion_messages)
+        suggestions=_parse_suggestions(suggestion_result["content"])
+        if suggestions:
+            with closing(get_db()) as db:
+                ts=now_iso()
+                db.execute("DELETE FROM chat_suggestions WHERE chat_id=?",(chat_id,))
+                db.execute("INSERT INTO chat_suggestions(chat_id,suggestions_json,created_at,updated_at) VALUES(?,?,?,?)",(chat_id,json.dumps(suggestions,ensure_ascii=False),ts,ts))
+                db.commit()
+    except Exception:
+        import logging
+        logging.exception("Post-response AI tasks failed for chat_id=%s",chat_id)
+
 app = FastAPI(title="ChatStudio API",version="0.1.0")
 app.add_middleware(SessionMiddleware,secret_key=SESSION_SECRET,session_cookie="chatstudio_session",same_site="lax",https_only=False,max_age=60*60*24*30)
 app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=False,allow_methods=["*"],allow_headers=["*"])
@@ -387,8 +459,22 @@ def search(request:Request,q:str=""):
         ).fetchall()
     return {"results":[dict(x) for x in rows]}
 
+@app.get("/api/chats/{chat_id}/suggestions")
+def get_chat_suggestions(chat_id:int,request:Request):
+    user=current_user(request)
+    with closing(get_db()) as db:
+        get_owned_chat(db,chat_id,int(user["id"]))
+        row=db.execute("SELECT suggestions_json,updated_at FROM chat_suggestions WHERE chat_id=? ORDER BY updated_at DESC LIMIT 1",(chat_id,)).fetchone()
+    if row is None:
+        return {"suggestions":[],"updated_at":None}
+    try:
+        suggestions=json.loads(row["suggestions_json"])
+    except Exception:
+        suggestions=[]
+    return {"suggestions":suggestions,"updated_at":row["updated_at"]}
+
 @app.post("/api/requests")
-def create_request(payload:MessageRequest,request:Request):
+def create_request(payload:MessageRequest,request:Request,background_tasks:BackgroundTasks):
     user=current_user(request)
     content=payload.content.strip()
     if not content:
@@ -411,6 +497,7 @@ def create_request(payload:MessageRequest,request:Request):
         db.commit()
         assistant=db.execute("SELECT id,chat_id,user_id,role,content,model,provider,routing_set,parent_message_id,created_at FROM messages WHERE id=?",(cur.lastrowid,)).fetchone()
         user_message=db.execute("SELECT id,chat_id,user_id,role,content,model,provider,routing_set,parent_message_id,created_at FROM messages WHERE id=?",(user_message_id,)).fetchone()
+    background_tasks.add_task(_run_post_response_tasks,payload.chat_id,int(user["id"]))
     return {"status":"completed","message":dict(user_message),"assistant":dict(assistant)}
  
 @app.get("/api/routing/providers")

@@ -7,6 +7,7 @@ import sqlite3
 import json
 import urllib.request
 import threading
+import time
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -150,9 +151,30 @@ def init_db() -> None:
             updated_at TEXT NOT NULL,
             FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS ai_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER,
+            task_key TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('queued','processing','completed','failed','cancelled')),
+            error TEXT,
+            provider TEXT,
+            model TEXT,
+            routing_set TEXT,
+            fallback_attempts_json TEXT,
+            created_at TEXT NOT NULL,
+            started_at TEXT,
+            completed_at TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE,
+            FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE SET NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_chats_user_updated ON chats(user_id,updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_messages_chat_created ON messages(chat_id,created_at);
         CREATE INDEX IF NOT EXISTS idx_files_user_created ON files(user_id,created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_ai_requests_user_created ON ai_requests(user_id,created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_ai_requests_chat_created ON ai_requests(chat_id,created_at DESC);
         """)
         db.commit()
 
@@ -285,19 +307,53 @@ class ModelRouter:
             raise RuntimeError("Провайдер вернул пустой ответ")
         return content
 
-    def generate(self, task_key: str, messages):
+    def generate(self, task_key: str, messages, cancel_check=None, request_id=None):
         with closing(get_db()) as db:
             models,routing_set_id=self._models_for_task(db,task_key)
         if not models:
             raise HTTPException(503,"В наборе маршрутизации нет доступных моделей")
+        attempts=[]
         with AI_SEMAPHORE:
             for model in models:
+                if cancel_check and cancel_check():
+                    raise RuntimeError("REQUEST_CANCELLED")
+                started=time_monotonic()
                 try:
                     content=self._request(model,messages)
-                    return {"content":content,"model":model["model_name"],"provider":model["provider_name"],"routing_set_id":routing_set_id}
-                except Exception:
-                    continue
-        raise HTTPException(502,"Все модели в наборе маршрутизации недоступны")
+                    attempts.append({"provider":model["provider_name"],"model":model["model_name"],"status":"success","duration_ms":int((time_monotonic()-started)*1000)})
+                    return {"content":content,"model":model["model_name"],"provider":model["provider_name"],"routing_set_id":routing_set_id,"fallback_attempts":attempts}
+                except Exception as exc:
+                    attempts.append({"provider":model["provider_name"],"model":model["model_name"],"status":"failed","error":str(exc)[:500],"duration_ms":int((time_monotonic()-started)*1000)})
+                    if request_id and cancel_check and cancel_check():
+                        raise RuntimeError("REQUEST_CANCELLED")
+        raise RuntimeError("ALL_MODELS_UNAVAILABLE")
+
+def time_monotonic():
+    return time.monotonic()
+
+def create_ai_request(user_id:int,chat_id:int,task_key:str,message_id=None):
+    ts=now_iso()
+    with closing(get_db()) as db:
+        cur=db.execute("INSERT INTO ai_requests(user_id,chat_id,message_id,task_key,status,created_at) VALUES(?,?,?,?,?,?)",(user_id,chat_id,message_id,task_key,"queued",ts))
+        db.commit()
+        return int(cur.lastrowid)
+
+def update_ai_request(request_id:int,**values):
+    if not values:
+        return
+    allowed={"status","error","provider","model","routing_set","fallback_attempts_json","message_id","started_at","completed_at"}
+    values={k:v for k,v in values.items() if k in allowed}
+    if not values: return
+    parts=[k+"=?" for k in values]
+    params=list(values.values())+[request_id]
+    with closing(get_db()) as db:
+        db.execute("UPDATE ai_requests SET "+",".join(parts)+" WHERE id=?",params)
+        db.commit()
+
+def ai_request_owned(db,request_id:int,user_id:int):
+    row=db.execute("SELECT * FROM ai_requests WHERE id=? AND user_id=?",(request_id,user_id)).fetchone()
+    if row is None: raise HTTPException(404,"Запрос не найден")
+    return row
 
 MODEL_ROUTER=ModelRouter()
 
@@ -501,9 +557,22 @@ def create_request(payload:MessageRequest,request:Request,background_tasks:Backg
         db.execute("UPDATE chats SET updated_at=? WHERE id=? AND user_id=?",(ts,payload.chat_id,user["id"]))
         db.commit()
         user_message_id=int(cur.lastrowid)
+    request_id=create_ai_request(int(user["id"]),payload.chat_id,"main_generation",user_message_id)
+    update_ai_request(request_id,status="processing",started_at=now_iso())
     ai_messages=[{"role":row["role"],"content":row["content"]} for row in history]
     ai_messages.append({"role":"user","content":content})
-    result=MODEL_ROUTER.generate("main_generation",ai_messages)
+    try:
+        result=MODEL_ROUTER.generate("main_generation",ai_messages,request_id=request_id)
+    except HTTPException as exc:
+        update_ai_request(request_id,status="failed",error=str(exc.detail),completed_at=now_iso())
+        raise
+    except RuntimeError as exc:
+        status="cancelled" if str(exc)=="REQUEST_CANCELLED" else "failed"
+        update_ai_request(request_id,status=status,error=str(exc),completed_at=now_iso())
+        raise HTTPException(502,"Запрос не выполнен")
+    except Exception as exc:
+        update_ai_request(request_id,status="failed",error=str(exc)[:500],completed_at=now_iso())
+        raise HTTPException(502,"Запрос не выполнен")
     with closing(get_db()) as db:
         ts=now_iso()
         cur=db.execute("INSERT INTO messages(chat_id,user_id,role,content,model,provider,routing_set,parent_message_id,created_at) VALUES(?,?, 'assistant',?,?,?,?,?,?,?)",(payload.chat_id,user["id"],result["content"],result["model"],result["provider"],str(result["routing_set_id"]),user_message_id,ts))
@@ -511,8 +580,9 @@ def create_request(payload:MessageRequest,request:Request,background_tasks:Backg
         db.commit()
         assistant=db.execute("SELECT id,chat_id,user_id,role,content,model,provider,routing_set,parent_message_id,created_at FROM messages WHERE id=?",(cur.lastrowid,)).fetchone()
         user_message=db.execute("SELECT id,chat_id,user_id,role,content,model,provider,routing_set,parent_message_id,created_at FROM messages WHERE id=?",(user_message_id,)).fetchone()
+    update_ai_request(request_id,status="completed",message_id=int(assistant["id"]),provider=result["provider"],model=result["model"],routing_set=str(result["routing_set_id"]),fallback_attempts_json=json.dumps(result.get("fallback_attempts",[]),ensure_ascii=False),completed_at=now_iso())
     background_tasks.add_task(_run_post_response_tasks,payload.chat_id,int(user["id"]))
-    return {"status":"completed","message":dict(user_message),"assistant":dict(assistant)}
+    return {"status":"completed","request_id":request_id,"message":dict(user_message),"assistant":dict(assistant)}
  
 class RoutingSetUpdateRequest(BaseModel):
     name: str | None = Field(default=None,min_length=1,max_length=120)
@@ -586,6 +656,27 @@ def change_routing_model_priority(routing_set_id:int,model_config_id:int,payload
         db.execute("UPDATE routing_sets SET updated_at=? WHERE id=?",(now_iso(),routing_set_id))
         db.commit()
     return {"ok":True}
+
+@app.get("/api/requests/{request_id}")
+def get_request_status(request_id:int,request:Request):
+    user=current_user(request)
+    with closing(get_db()) as db:
+        row=ai_request_owned(db,request_id,int(user["id"]))
+    data=dict(row)
+    if data.get("fallback_attempts_json"):
+        try: data["fallback_attempts"]=json.loads(data["fallback_attempts_json"])
+        except Exception: data["fallback_attempts"]=[]
+    else: data["fallback_attempts"]=[]
+    data.pop("fallback_attempts_json",None)
+    return {"request":data}
+
+@app.get("/api/chats/{chat_id}/requests")
+def list_chat_requests(chat_id:int,request:Request):
+    user=current_user(request)
+    with closing(get_db()) as db:
+        get_owned_chat(db,chat_id,int(user["id"]))
+        rows=db.execute("SELECT * FROM ai_requests WHERE chat_id=? AND user_id=? ORDER BY created_at DESC LIMIT 50",(chat_id,user["id"])).fetchall()
+    return {"requests":[dict(x) for x in rows]}
 
 @app.get("/api/routing/providers")
 def list_providers(request:Request):

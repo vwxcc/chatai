@@ -228,6 +228,20 @@ class ModelConfigRequest(BaseModel):
     max_tokens: int | None = Field(default=None,ge=1)
     timeout: int | None = Field(default=None,ge=1)
 
+class ProviderUpdateRequest(BaseModel):
+    name: str | None = Field(default=None,min_length=1,max_length=120)
+    base_url: str | None = Field(default=None,min_length=1,max_length=500)
+    api_key_env: str | None = Field(default=None,max_length=120)
+    enabled: bool | None = None
+
+class ModelConfigUpdateRequest(BaseModel):
+    name: str | None = Field(default=None,min_length=1,max_length=120)
+    model_name: str | None = Field(default=None,min_length=1,max_length=200)
+    temperature: float | None = Field(default=None,ge=0,max=2)
+    max_tokens: int | None = Field(default=None,ge=1)
+    timeout: int | None = Field(default=None,ge=1)
+    enabled: bool | None = None
+
 class RoutingSetModelRequest(BaseModel):
     model_config_id: int
     priority: int = Field(ge=1)
@@ -593,12 +607,72 @@ def create_provider(payload:ProviderRequest,request:Request):
         row=db.execute("SELECT id,name,base_url,api_key_env,enabled,created_at,updated_at FROM providers WHERE id=?",(cur.lastrowid,)).fetchone()
     return {"provider":dict(row)}
 
+@app.patch("/api/routing/providers/{provider_id}")
+def update_provider(provider_id:int,payload:ProviderUpdateRequest,request:Request):
+    current_user(request)
+    with closing(get_db()) as db:
+        row=db.execute("SELECT id,name,base_url,api_key_env,enabled,created_at,updated_at FROM providers WHERE id=?",(provider_id,)).fetchone()
+        if row is None: raise HTTPException(404,"Провайдер не найден")
+        name=payload.name.strip() if payload.name is not None else row["name"]
+        base_url=payload.base_url.strip() if payload.base_url is not None else row["base_url"]
+        api_key_env=payload.api_key_env if payload.api_key_env is not None else row["api_key_env"]
+        enabled=int(payload.enabled) if payload.enabled is not None else row["enabled"]
+        if not name or not base_url: raise HTTPException(400,"Название и URL провайдера обязательны")
+        try:
+            db.execute("UPDATE providers SET name=?,base_url=?,api_key_env=?,enabled=?,updated_at=? WHERE id=?",(name,base_url,api_key_env,enabled,now_iso(),provider_id))
+            db.commit()
+        except sqlite3.IntegrityError: raise HTTPException(409,"Провайдер с таким названием уже существует")
+        updated=db.execute("SELECT id,name,base_url,api_key_env,enabled,created_at,updated_at FROM providers WHERE id=?",(provider_id,)).fetchone()
+    return {"provider":dict(updated)}
+
+@app.delete("/api/routing/providers/{provider_id}")
+def delete_provider(provider_id:int,request:Request):
+    current_user(request)
+    with closing(get_db()) as db:
+        row=db.execute("SELECT id FROM providers WHERE id=?",(provider_id,)).fetchone()
+        if row is None: raise HTTPException(404,"Провайдер не найден")
+        if db.execute("SELECT 1 FROM model_configs WHERE provider_id=?",(provider_id,)).fetchone():
+            raise HTTPException(409,"Нельзя удалить провайдера, пока у него есть модели")
+        db.execute("DELETE FROM providers WHERE id=?",(provider_id,))
+        db.commit()
+    return {"ok":True}
+
 @app.get("/api/routing/models")
 def list_models(request:Request):
     current_user(request)
     with closing(get_db()) as db:
         rows=db.execute("SELECT mc.id,mc.name,mc.model_name,mc.temperature,mc.max_tokens,mc.timeout,mc.enabled,p.id AS provider_id,p.name AS provider_name FROM model_configs mc JOIN providers p ON p.id=mc.provider_id ORDER BY p.name COLLATE NOCASE,mc.name COLLATE NOCASE").fetchall()
     return {"models":[dict(x) for x in rows]}
+
+@app.patch("/api/routing/models/{model_id}")
+def update_model(model_id:int,payload:ModelConfigUpdateRequest,request:Request):
+    current_user(request)
+    with closing(get_db()) as db:
+        row=db.execute("SELECT id,provider_id,name,model_name,temperature,max_tokens,timeout,enabled,created_at,updated_at FROM model_configs WHERE id=?",(model_id,)).fetchone()
+        if row is None: raise HTTPException(404,"Модель не найдена")
+        name=payload.name.strip() if payload.name is not None else row["name"]
+        model_name=payload.model_name.strip() if payload.model_name is not None else row["model_name"]
+        temperature=payload.temperature if payload.temperature is not None else row["temperature"]
+        max_tokens=payload.max_tokens if payload.max_tokens is not None else row["max_tokens"]
+        timeout=payload.timeout if payload.timeout is not None else row["timeout"]
+        enabled=int(payload.enabled) if payload.enabled is not None else row["enabled"]
+        if not name or not model_name: raise HTTPException(400,"Название и model_name обязательны")
+        try:
+            db.execute("UPDATE model_configs SET name=?,model_name=?,temperature=?,max_tokens=?,timeout=?,enabled=?,updated_at=? WHERE id=?",(name,model_name,temperature,max_tokens,timeout,enabled,now_iso(),model_id))
+            db.commit()
+        except sqlite3.IntegrityError: raise HTTPException(409,"Такая модель уже существует у этого провайдера")
+        updated=db.execute("SELECT mc.id,mc.name,mc.model_name,mc.temperature,mc.max_tokens,mc.timeout,mc.enabled,p.id AS provider_id,p.name AS provider_name FROM model_configs mc JOIN providers p ON p.id=mc.provider_id WHERE mc.id=?",(model_id,)).fetchone()
+    return {"model":dict(updated)}
+
+@app.delete("/api/routing/models/{model_id}")
+def delete_model(model_id:int,request:Request):
+    current_user(request)
+    with closing(get_db()) as db:
+        if db.execute("SELECT 1 FROM model_configs WHERE id=?",(model_id,)).fetchone() is None:
+            raise HTTPException(404,"Модель не найдена")
+        db.execute("DELETE FROM model_configs WHERE id=?",(model_id,))
+        db.commit()
+    return {"ok":True}
 
 @app.post("/api/routing/models")
 def create_model(payload:ModelConfigRequest,request:Request):
@@ -671,6 +745,15 @@ def create_routing_set(payload:RoutingSetRequest,request:Request):
             raise HTTPException(409,"Набор с таким названием уже существует")
         row=db.execute("SELECT id,name,description,created_at,updated_at FROM routing_sets WHERE id=?",(cur.lastrowid,)).fetchone()
     return {"routing_set":dict(row)}
+
+@app.get("/api/routing/tasks/{task_key}")
+def get_task_route(task_key:str,request:Request):
+    current_user(request)
+    if task_key not in {"main_generation","title_generation","suggestions_generation"}:
+        raise HTTPException(400,"Неизвестная AI-задача")
+    with closing(get_db()) as db:
+        row=db.execute("SELECT tr.task_key,tr.routing_set_id,rs.name AS routing_set_name,tr.updated_at FROM task_routes tr LEFT JOIN routing_sets rs ON rs.id=tr.routing_set_id WHERE tr.task_key=?",(task_key,)).fetchone()
+    return {"task":dict(row) if row else {"task_key":task_key,"routing_set_id":None,"routing_set_name":None,"updated_at":None}}
 
 @app.get("/api/routing/tasks")
 def list_task_routes(request:Request):

@@ -4,6 +4,9 @@ import hmac
 import os
 import secrets
 import sqlite3
+import json
+import urllib.request
+import threading
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +31,9 @@ SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-only-change-me")
 MAX_NAME_LENGTH = int(os.getenv("MAX_NAME_LENGTH", "80"))
 MAX_PROMPT_LENGTH = int(os.getenv("MAX_PROMPT_LENGTH", "30000"))
 MAX_SEARCH_LENGTH = int(os.getenv("MAX_SEARCH_LENGTH", "200"))
+GLOBAL_AI_CONCURRENCY = int(os.getenv("GLOBAL_AI_CONCURRENCY", "3"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "300"))
+AI_SEMAPHORE = threading.BoundedSemaphore(max(1, GLOBAL_AI_CONCURRENCY))
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -221,6 +227,58 @@ class RoutingSetModelRequest(BaseModel):
 class TaskRouteRequest(BaseModel):
     routing_set_id: int | None = None
 
+class ModelRouter:
+    def _models_for_task(self, db: sqlite3.Connection, task_key: str):
+        row=db.execute("SELECT routing_set_id FROM task_routes WHERE task_key=?",(task_key,)).fetchone()
+        if not row or row["routing_set_id"] is None:
+            raise HTTPException(503,f"Для задачи {task_key} не настроен набор моделей")
+        models=db.execute("""
+            SELECT mc.id,mc.name,mc.model_name,mc.temperature,mc.max_tokens,mc.timeout,
+                   p.name AS provider_name,p.base_url,p.api_key_env
+            FROM routing_set_models rsm
+            JOIN model_configs mc ON mc.id=rsm.model_config_id
+            JOIN providers p ON p.id=mc.provider_id
+            WHERE rsm.routing_set_id=? AND mc.enabled=1 AND p.enabled=1
+            ORDER BY rsm.priority ASC
+        """,(row["routing_set_id"],)).fetchall()
+        return models,int(row["routing_set_id"])
+
+    def _request(self, model, messages):
+        api_key=os.getenv(model["api_key_env"]) if model["api_key_env"] else None
+        headers={"Content-Type":"application/json"}
+        if api_key:
+            headers["Authorization"]="Bearer "+api_key
+        payload={"model":model["model_name"],"messages":messages}
+        if model["temperature"] is not None:
+            payload["temperature"]=model["temperature"]
+        if model["max_tokens"] is not None:
+            payload["max_tokens"]=model["max_tokens"]
+        timeout=int(model["timeout"] or REQUEST_TIMEOUT)
+        url=model["base_url"].rstrip("/")+"/chat/completions"
+        req=urllib.request.Request(url,data=json.dumps(payload).encode("utf-8"),headers=headers,method="POST")
+        with urllib.request.urlopen(req,timeout=timeout) as response:
+            data=json.loads(response.read().decode("utf-8"))
+        content=data.get("choices",[{}])[0].get("message",{}).get("content")
+        if not isinstance(content,str) or not content.strip():
+            raise RuntimeError("Провайдер вернул пустой ответ")
+        return content
+
+    def generate(self, task_key: str, messages):
+        with closing(get_db()) as db:
+            models,routing_set_id=self._models_for_task(db,task_key)
+        if not models:
+            raise HTTPException(503,"В наборе маршрутизации нет доступных моделей")
+        with AI_SEMAPHORE:
+            for model in models:
+                try:
+                    content=self._request(model,messages)
+                    return {"content":content,"model":model["model_name"],"provider":model["provider_name"],"routing_set_id":routing_set_id}
+                except Exception:
+                    continue
+        raise HTTPException(502,"Все модели в наборе маршрутизации недоступны")
+
+MODEL_ROUTER=ModelRouter()
+
 app = FastAPI(title="ChatStudio API",version="0.1.0")
 app.add_middleware(SessionMiddleware,secret_key=SESSION_SECRET,session_cookie="chatstudio_session",same_site="lax",https_only=False,max_age=60*60*24*30)
 app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=False,allow_methods=["*"],allow_headers=["*"])
@@ -332,19 +390,29 @@ def search(request:Request,q:str=""):
 @app.post("/api/requests")
 def create_request(payload:MessageRequest,request:Request):
     user=current_user(request)
+    content=payload.content.strip()
+    if not content:
+        raise HTTPException(400,"Сообщение не может быть пустым")
     with closing(get_db()) as db:
         get_owned_chat(db,payload.chat_id,int(user["id"]))
+        history=db.execute("SELECT role,content FROM messages WHERE chat_id=? ORDER BY created_at ASC,id ASC",(payload.chat_id,)).fetchall()
         ts=now_iso()
-        cur=db.execute(
-            "INSERT INTO messages(chat_id,user_id,role,content,parent_message_id,created_at) VALUES(?,?,\'user\',?,?,?)",
-            (payload.chat_id,user["id"],payload.content,payload.parent_message_id,ts)
-        )
+        cur=db.execute("INSERT INTO messages(chat_id,user_id,role,content,parent_message_id,created_at) VALUES(?,?, 'user',?,?,?)",(payload.chat_id,user["id"],content,payload.parent_message_id,ts))
         db.execute("UPDATE chats SET updated_at=? WHERE id=? AND user_id=?",(ts,payload.chat_id,user["id"]))
         db.commit()
-        message=db.execute("SELECT id,chat_id,user_id,role,content,model,provider,routing_set,parent_message_id,created_at FROM messages WHERE id=?",(cur.lastrowid,)).fetchone()
-    return {"message":dict(message),"status":"queued"}
-
-
+        user_message_id=int(cur.lastrowid)
+    ai_messages=[{"role":row["role"],"content":row["content"]} for row in history]
+    ai_messages.append({"role":"user","content":content})
+    result=MODEL_ROUTER.generate("main_generation",ai_messages)
+    with closing(get_db()) as db:
+        ts=now_iso()
+        cur=db.execute("INSERT INTO messages(chat_id,user_id,role,content,model,provider,routing_set,parent_message_id,created_at) VALUES(?,?, 'assistant',?,?,?,?,?,?,?)",(payload.chat_id,user["id"],result["content"],result["model"],result["provider"],str(result["routing_set_id"]),user_message_id,ts))
+        db.execute("UPDATE chats SET updated_at=? WHERE id=? AND user_id=?",(ts,payload.chat_id,user["id"]))
+        db.commit()
+        assistant=db.execute("SELECT id,chat_id,user_id,role,content,model,provider,routing_set,parent_message_id,created_at FROM messages WHERE id=?",(cur.lastrowid,)).fetchone()
+        user_message=db.execute("SELECT id,chat_id,user_id,role,content,model,provider,routing_set,parent_message_id,created_at FROM messages WHERE id=?",(user_message_id,)).fetchone()
+    return {"status":"completed","message":dict(user_message),"assistant":dict(assistant)}
+ 
 @app.get("/api/routing/providers")
 def list_providers(request:Request):
     current_user(request)

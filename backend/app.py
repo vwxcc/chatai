@@ -500,6 +500,79 @@ def create_request(payload:MessageRequest,request:Request,background_tasks:Backg
     background_tasks.add_task(_run_post_response_tasks,payload.chat_id,int(user["id"]))
     return {"status":"completed","message":dict(user_message),"assistant":dict(assistant)}
  
+class RoutingSetUpdateRequest(BaseModel):
+    name: str | None = Field(default=None,min_length=1,max_length=120)
+    description: str | None = Field(default=None,max_length=500)
+
+class RoutingSetPriorityRequest(BaseModel):
+    priority: int = Field(ge=1)
+
+def _normalize_routing_priorities(db, routing_set_id):
+    rows=db.execute("SELECT model_config_id FROM routing_set_models WHERE routing_set_id=? ORDER BY priority,model_config_id",(routing_set_id,)).fetchall()
+    for priority,row in enumerate(rows,1):
+        db.execute("UPDATE routing_set_models SET priority=? WHERE routing_set_id=? AND model_config_id=?",(priority+1000,routing_set_id,row["model_config_id"]))
+    for priority,row in enumerate(rows,1):
+        db.execute("UPDATE routing_set_models SET priority=? WHERE routing_set_id=? AND model_config_id=?",(priority,routing_set_id,row["model_config_id"]))
+
+@app.patch("/api/routing/sets/{routing_set_id}")
+def update_routing_set(routing_set_id:int,payload:RoutingSetUpdateRequest,request:Request):
+    current_user(request)
+    with closing(get_db()) as db:
+        row=db.execute("SELECT id,name,description,created_at,updated_at FROM routing_sets WHERE id=?",(routing_set_id,)).fetchone()
+        if row is None: raise HTTPException(404,"Набор маршрутизации не найден")
+        name=payload.name.strip() if payload.name is not None else row["name"]
+        description=payload.description if payload.description is not None else row["description"]
+        try:
+            db.execute("UPDATE routing_sets SET name=?,description=?,updated_at=? WHERE id=?",(name,description,now_iso(),routing_set_id))
+            db.commit()
+        except sqlite3.IntegrityError: raise HTTPException(409,"Набор с таким названием уже существует")
+        updated=db.execute("SELECT id,name,description,created_at,updated_at FROM routing_sets WHERE id=?",(routing_set_id,)).fetchone()
+    return {"routing_set":dict(updated)}
+
+@app.delete("/api/routing/sets/{routing_set_id}")
+def delete_routing_set(routing_set_id:int,request:Request):
+    current_user(request)
+    with closing(get_db()) as db:
+        if db.execute("SELECT id FROM routing_sets WHERE id=?",(routing_set_id,)).fetchone() is None:
+            raise HTTPException(404,"Набор маршрутизации не найден")
+        if db.execute("SELECT task_key FROM task_routes WHERE routing_set_id=?",(routing_set_id,)).fetchone():
+            raise HTTPException(409,"Нельзя удалить набор, пока он назначен AI-задаче")
+        db.execute("DELETE FROM routing_sets WHERE id=?",(routing_set_id,))
+        db.commit()
+    return {"ok":True}
+
+@app.delete("/api/routing/sets/{routing_set_id}/models/{model_config_id}")
+def remove_model_from_routing_set(routing_set_id:int,model_config_id:int,request:Request):
+    current_user(request)
+    with closing(get_db()) as db:
+        if db.execute("SELECT id FROM routing_sets WHERE id=?",(routing_set_id,)).fetchone() is None:
+            raise HTTPException(404,"Набор маршрутизации не найден")
+        if not db.execute("SELECT 1 FROM routing_set_models WHERE routing_set_id=? AND model_config_id=?",(routing_set_id,model_config_id)).fetchone():
+            raise HTTPException(404,"Модель не находится в этом наборе")
+        db.execute("DELETE FROM routing_set_models WHERE routing_set_id=? AND model_config_id=?",(routing_set_id,model_config_id))
+        _normalize_routing_priorities(db,routing_set_id)
+        db.execute("UPDATE routing_sets SET updated_at=? WHERE id=?",(now_iso(),routing_set_id))
+        db.commit()
+    return {"ok":True}
+
+@app.patch("/api/routing/sets/{routing_set_id}/models/{model_config_id}")
+def change_routing_model_priority(routing_set_id:int,model_config_id:int,payload:RoutingSetPriorityRequest,request:Request):
+    current_user(request)
+    with closing(get_db()) as db:
+        rows=db.execute("SELECT model_config_id FROM routing_set_models WHERE routing_set_id=? ORDER BY priority,model_config_id",(routing_set_id,)).fetchall()
+        ids=[int(x["model_config_id"]) for x in rows]
+        if model_config_id not in ids: raise HTTPException(404,"Модель не находится в этом наборе")
+        if payload.priority>len(ids): raise HTTPException(400,"Приоритет вне диапазона")
+        ids.remove(model_config_id)
+        ids.insert(payload.priority-1,model_config_id)
+        for priority,mid in enumerate(ids,1):
+            db.execute("UPDATE routing_set_models SET priority=? WHERE routing_set_id=? AND model_config_id=?",(priority+1000,routing_set_id,mid))
+        for priority,mid in enumerate(ids,1):
+            db.execute("UPDATE routing_set_models SET priority=? WHERE routing_set_id=? AND model_config_id=?",(priority,routing_set_id,mid))
+        db.execute("UPDATE routing_sets SET updated_at=? WHERE id=?",(now_iso(),routing_set_id))
+        db.commit()
+    return {"ok":True}
+
 @app.get("/api/routing/providers")
 def list_providers(request:Request):
     current_user(request)

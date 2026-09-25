@@ -201,6 +201,26 @@ class RoutingSetRequest(BaseModel):
     name: str = Field(min_length=1,max_length=120)
     description: str | None = Field(default=None,max_length=500)
 
+class ProviderRequest(BaseModel):
+    name: str = Field(min_length=1,max_length=120)
+    base_url: str = Field(min_length=1,max_length=500)
+    api_key_env: str | None = Field(default=None,max_length=120)
+
+class ModelConfigRequest(BaseModel):
+    provider_id: int
+    name: str = Field(min_length=1,max_length=120)
+    model_name: str = Field(min_length=1,max_length=200)
+    temperature: float | None = Field(default=None,ge=0,max=2)
+    max_tokens: int | None = Field(default=None,ge=1)
+    timeout: int | None = Field(default=None,ge=1)
+
+class RoutingSetModelRequest(BaseModel):
+    model_config_id: int
+    priority: int = Field(ge=1)
+
+class TaskRouteRequest(BaseModel):
+    routing_set_id: int | None = None
+
 app = FastAPI(title="ChatStudio API",version="0.1.0")
 app.add_middleware(SessionMiddleware,secret_key=SESSION_SECRET,session_cookie="chatstudio_session",same_site="lax",https_only=False,max_age=60*60*24*30)
 app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=False,allow_methods=["*"],allow_headers=["*"])
@@ -323,6 +343,78 @@ def create_request(payload:MessageRequest,request:Request):
         db.commit()
         message=db.execute("SELECT id,chat_id,user_id,role,content,model,provider,routing_set,parent_message_id,created_at FROM messages WHERE id=?",(cur.lastrowid,)).fetchone()
     return {"message":dict(message),"status":"queued"}
+
+
+@app.get("/api/routing/providers")
+def list_providers(request:Request):
+    current_user(request)
+    with closing(get_db()) as db:
+        rows=db.execute("SELECT id,name,base_url,api_key_env,enabled,created_at,updated_at FROM providers ORDER BY name COLLATE NOCASE").fetchall()
+    return {"providers":[dict(x) for x in rows]}
+
+@app.post("/api/routing/providers")
+def create_provider(payload:ProviderRequest,request:Request):
+    current_user(request)
+    ts=now_iso()
+    with closing(get_db()) as db:
+        try:
+            cur=db.execute("INSERT INTO providers(name,base_url,api_key_env,created_at,updated_at) VALUES(?,?,?,?,?)",(payload.name.strip(),payload.base_url.strip(),payload.api_key_env,ts,ts))
+            db.commit()
+        except sqlite3.IntegrityError:
+            raise HTTPException(409,"Провайдер с таким названием уже существует")
+        row=db.execute("SELECT id,name,base_url,api_key_env,enabled,created_at,updated_at FROM providers WHERE id=?",(cur.lastrowid,)).fetchone()
+    return {"provider":dict(row)}
+
+@app.get("/api/routing/models")
+def list_models(request:Request):
+    current_user(request)
+    with closing(get_db()) as db:
+        rows=db.execute("SELECT mc.id,mc.name,mc.model_name,mc.temperature,mc.max_tokens,mc.timeout,mc.enabled,p.id AS provider_id,p.name AS provider_name FROM model_configs mc JOIN providers p ON p.id=mc.provider_id ORDER BY p.name COLLATE NOCASE,mc.name COLLATE NOCASE").fetchall()
+    return {"models":[dict(x) for x in rows]}
+
+@app.post("/api/routing/models")
+def create_model(payload:ModelConfigRequest,request:Request):
+    current_user(request)
+    ts=now_iso()
+    with closing(get_db()) as db:
+        if db.execute("SELECT id FROM providers WHERE id=?",(payload.provider_id,)).fetchone() is None:
+            raise HTTPException(404,"Провайдер не найден")
+        try:
+            cur=db.execute("INSERT INTO model_configs(provider_id,name,model_name,temperature,max_tokens,timeout,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",(payload.provider_id,payload.name.strip(),payload.model_name.strip(),payload.temperature,payload.max_tokens,payload.timeout,ts,ts))
+            db.commit()
+        except sqlite3.IntegrityError:
+            raise HTTPException(409,"Такая модель уже существует у этого провайдера")
+        row=db.execute("SELECT mc.id,mc.name,mc.model_name,mc.temperature,mc.max_tokens,mc.timeout,mc.enabled,p.id AS provider_id,p.name AS provider_name FROM model_configs mc JOIN providers p ON p.id=mc.provider_id WHERE mc.id=?",(cur.lastrowid,)).fetchone()
+    return {"model":dict(row)}
+
+@app.post("/api/routing/sets/{routing_set_id}/models")
+def add_model_to_routing_set(routing_set_id:int,payload:RoutingSetModelRequest,request:Request):
+    current_user(request)
+    with closing(get_db()) as db:
+        if db.execute("SELECT id FROM routing_sets WHERE id=?",(routing_set_id,)).fetchone() is None:
+            raise HTTPException(404,"Набор маршрутизации не найден")
+        if db.execute("SELECT id FROM model_configs WHERE id=? AND enabled=1",(payload.model_config_id,)).fetchone() is None:
+            raise HTTPException(404,"Модель не найдена или отключена")
+        if db.execute("SELECT 1 FROM routing_set_models WHERE routing_set_id=? AND priority=?",(routing_set_id,payload.priority)).fetchone():
+            raise HTTPException(409,"Этот приоритет уже занят")
+        try:
+            db.execute("INSERT INTO routing_set_models(routing_set_id,model_config_id,priority) VALUES(?,?,?)",(routing_set_id,payload.model_config_id,payload.priority))
+            db.commit()
+        except sqlite3.IntegrityError:
+            raise HTTPException(409,"Модель уже находится в этом наборе")
+    return {"ok":True}
+
+@app.put("/api/routing/tasks/{task_key}")
+def set_task_route(task_key:str,payload:TaskRouteRequest,request:Request):
+    current_user(request)
+    if task_key not in {"main_generation","title_generation","suggestions_generation"}:
+        raise HTTPException(400,"Неизвестная AI-задача")
+    with closing(get_db()) as db:
+        if payload.routing_set_id is not None and db.execute("SELECT id FROM routing_sets WHERE id=?",(payload.routing_set_id,)).fetchone() is None:
+            raise HTTPException(404,"Набор маршрутизации не найден")
+        db.execute("INSERT INTO task_routes(task_key,routing_set_id,updated_at) VALUES(?,?,?) ON CONFLICT(task_key) DO UPDATE SET routing_set_id=excluded.routing_set_id,updated_at=excluded.updated_at",(task_key,payload.routing_set_id,now_iso()))
+        db.commit()
+    return {"ok":True,"task_key":task_key,"routing_set_id":payload.routing_set_id}
 
 @app.get("/api/routing/sets")
 def list_routing_sets(request:Request):

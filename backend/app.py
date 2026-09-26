@@ -333,6 +333,7 @@ class MessageRequest(BaseModel):
     content: str = Field(default="",max_length=MAX_PROMPT_LENGTH)
     parent_message_id: int | None = None
     file_ids: list[int] = Field(default_factory=list,max_length=MAX_FILES_PER_REQUEST)
+    edit_message_id: int | None = None
 
 class RoutingSetRequest(BaseModel):
     name: str = Field(min_length=1,max_length=120)
@@ -841,12 +842,25 @@ def create_request(payload:MessageRequest,request:Request,background_tasks:Backg
             if sum(int(x["size"]) for x in files)>MAX_TOTAL_FILE_SIZE:
                 raise HTTPException(413,f"Общий размер файлов слишком большой. Максимум: {MAX_TOTAL_FILE_SIZE // 1024 // 1024} МБ")
         ts=now_iso()
-        cur=db.execute("INSERT INTO messages(chat_id,user_id,role,content,parent_message_id,created_at) VALUES(?,?, 'user',?,?,?)",(payload.chat_id,user["id"],content,payload.parent_message_id,ts))
-        if files:
-            db.executemany("INSERT INTO message_files(message_id,file_id) VALUES(?,?)",[(int(cur.lastrowid),int(x["id"])) for x in files])
+        if payload.edit_message_id is not None:
+            target=db.execute("SELECT id FROM messages WHERE id=? AND chat_id=? AND user_id=? AND role='user'",(payload.edit_message_id,payload.chat_id,user["id"])).fetchone()
+            if target is None:
+                raise HTTPException(404,"Редактируемое сообщение не найдено")
+            if payload.parent_message_id is not None and int(payload.parent_message_id)==int(payload.edit_message_id):
+                raise HTTPException(400,"Сообщение не может быть родителем самого себя")
+            db.execute("DELETE FROM messages WHERE chat_id=? AND id>?",(payload.chat_id,payload.edit_message_id))
+            db.execute("UPDATE messages SET content=?,parent_message_id=? WHERE id=?",(content,payload.parent_message_id,payload.edit_message_id))
+            db.execute("DELETE FROM message_files WHERE message_id=?",(payload.edit_message_id,))
+            if files:
+                db.executemany("INSERT INTO message_files(message_id,file_id) VALUES(?,?)",[(payload.edit_message_id,int(x["id"])) for x in files])
+            user_message_id=int(payload.edit_message_id)
+        else:
+            cur=db.execute("INSERT INTO messages(chat_id,user_id,role,content,parent_message_id,created_at) VALUES(?,?, 'user',?,?,?)",(payload.chat_id,user["id"],content,payload.parent_message_id,ts))
+            if files:
+                db.executemany("INSERT INTO message_files(message_id,file_id) VALUES(?,?)",[(int(cur.lastrowid),int(x["id"])) for x in files])
+            user_message_id=int(cur.lastrowid)
         db.execute("UPDATE chats SET updated_at=? WHERE id=? AND user_id=?",(ts,payload.chat_id,user["id"]))
         db.commit()
-        user_message_id=int(cur.lastrowid)
     request_id=create_ai_request(int(user["id"]),payload.chat_id,"main_generation",user_message_id)
     update_ai_request(request_id,status="processing",started_at=now_iso())
     with closing(get_db()) as db:
@@ -1054,12 +1068,25 @@ def stream_request(payload:MessageRequest,request:Request,background_tasks:Backg
             if sum(int(x["size"]) for x in files)>MAX_TOTAL_FILE_SIZE:
                 raise HTTPException(413,f"Общий размер файлов слишком большой. Максимум: {MAX_TOTAL_FILE_SIZE // 1024 // 1024} МБ")
         ts=now_iso()
-        cur=db.execute("INSERT INTO messages(chat_id,user_id,role,content,parent_message_id,created_at) VALUES(?,?, 'user',?,?,?)",(payload.chat_id,user["id"],content,payload.parent_message_id,ts))
-        if files:
-            db.executemany("INSERT INTO message_files(message_id,file_id) VALUES(?,?)",[(int(cur.lastrowid),int(x["id"])) for x in files])
+        if payload.edit_message_id is not None:
+            target=db.execute("SELECT id FROM messages WHERE id=? AND chat_id=? AND user_id=? AND role='user'",(payload.edit_message_id,payload.chat_id,user["id"])).fetchone()
+            if target is None:
+                raise HTTPException(404,"Редактируемое сообщение не найдено")
+            if payload.parent_message_id is not None and int(payload.parent_message_id)==int(payload.edit_message_id):
+                raise HTTPException(400,"Сообщение не может быть родителем самого себя")
+            db.execute("DELETE FROM messages WHERE chat_id=? AND id>?",(payload.chat_id,payload.edit_message_id))
+            db.execute("UPDATE messages SET content=?,parent_message_id=? WHERE id=?",(content,payload.parent_message_id,payload.edit_message_id))
+            db.execute("DELETE FROM message_files WHERE message_id=?",(payload.edit_message_id,))
+            if files:
+                db.executemany("INSERT INTO message_files(message_id,file_id) VALUES(?,?)",[(payload.edit_message_id,int(x["id"])) for x in files])
+            user_message_id=int(payload.edit_message_id)
+        else:
+            cur=db.execute("INSERT INTO messages(chat_id,user_id,role,content,parent_message_id,created_at) VALUES(?,?, 'user',?,?,?)",(payload.chat_id,user["id"],content,payload.parent_message_id,ts))
+            if files:
+                db.executemany("INSERT INTO message_files(message_id,file_id) VALUES(?,?)",[(int(cur.lastrowid),int(x["id"])) for x in files])
+            user_message_id=int(cur.lastrowid)
         db.execute("UPDATE chats SET updated_at=? WHERE id=? AND user_id=?",(ts,payload.chat_id,user["id"]))
         db.commit()
-        user_message_id=int(cur.lastrowid)
     request_id=create_ai_request(int(user["id"]),payload.chat_id,"main_generation",user_message_id)
     update_ai_request(request_id,status="processing",started_at=now_iso())
     with closing(get_db()) as db:

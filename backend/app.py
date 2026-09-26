@@ -901,7 +901,7 @@ def update_routing_set(routing_set_id:int,payload:RoutingSetUpdateRequest,reques
 
 @app.delete("/api/routing/sets/{routing_set_id}")
 def delete_routing_set(routing_set_id:int,request:Request):
-    current_user(request)
+    require_admin(request)
     with closing(get_db()) as db:
         if db.execute("SELECT id FROM routing_sets WHERE id=?",(routing_set_id,)).fetchone() is None:
             raise HTTPException(404,"Набор маршрутизации не найден")
@@ -913,7 +913,7 @@ def delete_routing_set(routing_set_id:int,request:Request):
 
 @app.delete("/api/routing/sets/{routing_set_id}/models/{model_config_id}")
 def remove_model_from_routing_set(routing_set_id:int,model_config_id:int,request:Request):
-    current_user(request)
+    require_admin(request)
     with closing(get_db()) as db:
         if db.execute("SELECT id FROM routing_sets WHERE id=?",(routing_set_id,)).fetchone() is None:
             raise HTTPException(404,"Набор маршрутизации не найден")
@@ -927,7 +927,7 @@ def remove_model_from_routing_set(routing_set_id:int,model_config_id:int,request
 
 @app.patch("/api/routing/sets/{routing_set_id}/models/{model_config_id}")
 def change_routing_model_priority(routing_set_id:int,model_config_id:int,payload:RoutingSetPriorityRequest,request:Request):
-    current_user(request)
+    require_admin(request)
     with closing(get_db()) as db:
         rows=db.execute("SELECT model_config_id FROM routing_set_models WHERE routing_set_id=? ORDER BY priority,model_config_id",(routing_set_id,)).fetchall()
         ids=[int(x["model_config_id"]) for x in rows]

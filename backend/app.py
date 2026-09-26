@@ -627,7 +627,7 @@ def get_chat_suggestions(chat_id:int,request:Request):
 def create_request(payload:MessageRequest,request:Request,background_tasks:BackgroundTasks):
     user=current_user(request)
     content=payload.content.strip()
-    if not content:
+    if not content and not payload.file_ids:
         raise HTTPException(400,"Сообщение не может быть пустым")
     with closing(get_db()) as db:
         get_owned_chat(db,payload.chat_id,int(user["id"]))

@@ -540,6 +540,14 @@ def ai_request_owned(db,request_id:int,user_id:int):
     if row is None: raise HTTPException(404,"Запрос не найден")
     return row
 
+def ensure_no_active_main_request(db,chat_id:int):
+    row=db.execute(
+        "SELECT id FROM ai_requests WHERE chat_id=? AND task_key='main_generation' AND status IN ('queued','processing') LIMIT 1",
+        (chat_id,)
+    ).fetchone()
+    if row is not None:
+        raise HTTPException(409,"В этом чате уже выполняется запрос")
+
 MODEL_ROUTER=ModelRouter()
 
 def _safe_title_context(messages):
@@ -1001,7 +1009,8 @@ def cancel_request(request_id:int,request:Request):
         elif status == "queued":
             ts=now_iso()
             db.execute(
-                "UPDATE ai_requests SET status='cancelled',cancel_requested=1,completed_at=? WHERE id=? AND user_id=?",
+                "UPDATE ai_requests SET status='cancelled',cancel_requested=1,completed_at=? "
+                "WHERE id=? AND user_id=? AND status='queued' AND cancel_requested=0",
                 (ts,request_id,user["id"])
             )
             db.commit()
@@ -1026,6 +1035,8 @@ def edit_message(message_id:int,payload:MessageRequest,request:Request):
     user=current_user(request)
     with closing(get_db()) as db:
         row=db.execute("SELECT m.*,c.user_id FROM messages m JOIN chats c ON c.id=m.chat_id WHERE m.id=? AND m.role='user'",(message_id,)).fetchone()
+        if row is not None:
+            ensure_no_active_main_request(db,int(row["chat_id"]))
         if row is None or int(row["user_id"])!=int(user["id"]): raise HTTPException(404,"Сообщение не найдено")
         if not payload.content and not payload.file_ids: raise HTTPException(400,"Сообщение не может быть пустым")
         if payload.parent_message_id is not None:
@@ -1049,6 +1060,8 @@ def branch_message(message_id:int,request:Request):
     user=current_user(request)
     with closing(get_db()) as db:
         row=db.execute("SELECT m.*,c.user_id,c.title FROM messages m JOIN chats c ON c.id=m.chat_id WHERE m.id=?",(message_id,)).fetchone()
+        if row is not None:
+            ensure_no_active_main_request(db,int(row["chat_id"]))
         if row is None or int(row["user_id"])!=int(user["id"]): raise HTTPException(404,"Сообщение не найдено")
         ts=now_iso()
         title=(row["title"] or "Новый чат")+" — ветка"

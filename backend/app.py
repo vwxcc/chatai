@@ -1018,12 +1018,14 @@ def edit_message(message_id:int,payload:MessageRequest,request:Request):
         if payload.parent_message_id is not None:
             parent=db.execute("SELECT id FROM messages WHERE id=? AND chat_id=? AND user_id=?",(payload.parent_message_id,row["chat_id"],user["id"])).fetchone()
             if parent is None: raise HTTPException(404,"Родительское сообщение не найдено")
-        db.execute("UPDATE messages SET content=?,parent_message_id=? WHERE id=?",(payload.content,payload.parent_message_id,message_id))
-        db.execute("DELETE FROM message_files WHERE message_id=?",(message_id,))
+        files=[]
         if payload.file_ids:
             placeholders=",".join("?" for _ in payload.file_ids)
             files=db.execute(f"SELECT id FROM files WHERE user_id=? AND id IN ({placeholders})",(user["id"],*payload.file_ids)).fetchall()
             if len(files)!=len(set(payload.file_ids)): raise HTTPException(404,"Файл не найден")
+        db.execute("UPDATE messages SET content=?,parent_message_id=? WHERE id=?",(payload.content,payload.parent_message_id,message_id))
+        db.execute("DELETE FROM message_files WHERE message_id=?",(message_id,))
+        if files:
             db.executemany("INSERT INTO message_files(message_id,file_id) VALUES(?,?)",[(message_id,int(x["id"])) for x in files])
         db.execute("UPDATE chats SET updated_at=? WHERE id=?",(now_iso(),row["chat_id"]))
         db.commit()

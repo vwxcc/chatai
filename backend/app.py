@@ -573,7 +573,7 @@ class ModelRouter:
                     timeout=int(model["timeout"] or REQUEST_TIMEOUT)
                     url=model["base_url"].rstrip("/")+"/chat/completions"
                     req=urllib.request.Request(url,data=json.dumps(payload).encode("utf-8"),headers=headers,method="POST")
-                    response=urllib.request.urlopen(req,timeout=timeout)
+                    response=urllib.request.urlopen(req,timeout=max(AI_CONNECT_TIMEOUT,timeout))
                     try:
                         saw_content=False
                         for raw_line in response:

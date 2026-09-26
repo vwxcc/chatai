@@ -276,6 +276,18 @@ def _file_extension(filename: str) -> str:
 def _safe_stored_filename(filename: str) -> str:
     return secrets.token_hex(16) + _file_extension(filename)
 
+def _stored_file_path(path_value: str) -> Path:
+    base = UPLOAD_DIR.resolve()
+    path = Path(path_value)
+    if not path.is_absolute():
+        path = PROJECT_DIR / path
+    resolved = path.resolve()
+    try:
+        resolved.relative_to(base)
+    except ValueError:
+        raise HTTPException(404, "Файл не найден")
+    return resolved
+
 def _read_file_for_ai(row: sqlite3.Row):
     path=Path(row["path"])
     if not path.is_file(): return None
@@ -831,8 +843,10 @@ def get_shared_file(token:str,file_id:int):
     chat,_,share=_shared_chat(token)
     with closing(get_db()) as db:
         row=db.execute("SELECT f.path,f.filename,f.mime_type FROM files f JOIN message_files mf ON mf.file_id=f.id JOIN messages m ON m.id=mf.message_id JOIN chats c ON c.id=m.chat_id WHERE f.id=? AND m.chat_id=? AND f.user_id=c.user_id",(file_id,chat["id"])).fetchone()
-    if row is None or not Path(row["path"]).is_file(): raise HTTPException(404,"Файл не найден")
-    return FileResponse(row["path"],media_type=row["mime_type"] or "application/octet-stream",filename=row["filename"])
+    if row is None: raise HTTPException(404,"Файл не найден")
+    path=_stored_file_path(row["path"])
+    if not path.is_file(): raise HTTPException(404,"Файл не найден")
+    return FileResponse(str(path),media_type=row["mime_type"] or "application/octet-stream",filename=row["filename"])
 
 @app.patch("/api/chats/{chat_id}")
 def rename_chat(chat_id:int,payload:RenameChatRequest,request:Request):
@@ -1476,7 +1490,11 @@ async def upload_file(request:Request):
     if _file_extension(filename) not in ALLOWED_FILE_EXTENSIONS: raise HTTPException(400,"Этот тип файла не поддерживается")
     data=await upload.read()
     if len(data)>MAX_FILE_SIZE: raise HTTPException(413,f"Файл слишком большой. Максимум: {MAX_FILE_SIZE // 1024 // 1024} МБ")
-    target=UPLOAD_DIR/_safe_stored_filename(filename)
+    target=(UPLOAD_DIR/_safe_stored_filename(filename)).resolve()
+    try:
+        target.relative_to(UPLOAD_DIR.resolve())
+    except ValueError:
+        raise HTTPException(400,"Некорректный путь файла")
     target.write_bytes(data)
     mime=upload.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
     try:
@@ -1508,7 +1526,8 @@ def delete_file(file_id:int,request:Request):
             raise HTTPException(409,"Файл используется в истории чатов. Сначала удалите сообщения с этим вложением или оставьте файл в библиотеке.")
         db.execute("DELETE FROM files WHERE id=? AND user_id=?",(file_id,user["id"]))
         db.commit()
-    Path(row["path"]).unlink(missing_ok=True)
+    path=_stored_file_path(row["path"])
+    path.unlink(missing_ok=True)
     return {"ok":True}
 
 @app.get("/api/files")

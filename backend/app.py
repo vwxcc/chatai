@@ -10,6 +10,8 @@ import threading
 import time
 import base64
 import mimetypes
+import io
+import zipfile
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +54,8 @@ ALLOWED_FILE_EXTENSIONS = {".pdf",".docx",".txt",".md",".csv",".xls",".xlsx",".p
 GLOBAL_AI_CONCURRENCY = int(os.getenv("GLOBAL_AI_CONCURRENCY", "3"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "300"))
 MAX_FILE_CONTEXT_CHARS = int(os.getenv("MAX_FILE_CONTEXT_CHARS", "500000"))
+MAX_ARCHIVE_ENTRIES = int(os.getenv("MAX_ARCHIVE_ENTRIES", "2000"))
+MAX_ARCHIVE_UNCOMPRESSED_SIZE = int(os.getenv("MAX_ARCHIVE_UNCOMPRESSED_SIZE", str(100 * 1024 * 1024)))
 AI_SEMAPHORE = threading.BoundedSemaphore(max(1, GLOBAL_AI_CONCURRENCY))
 AUTH_RATE_WINDOW = int(os.getenv("AUTH_RATE_WINDOW", "900"))
 AUTH_LOGIN_LIMIT = int(os.getenv("AUTH_LOGIN_LIMIT", "10"))
@@ -276,6 +280,25 @@ def _file_extension(filename: str) -> str:
 
 def _safe_stored_filename(filename: str) -> str:
     return secrets.token_hex(16) + _file_extension(filename)
+
+def _validate_archive_payload(filename: str, data: bytes) -> None:
+    ext=_file_extension(filename)
+    if ext not in {".zip",".docx",".xlsx",".pptx"}:
+        return
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            infos=archive.infolist()
+            if len(infos)>MAX_ARCHIVE_ENTRIES:
+                raise HTTPException(413,"Архив содержит слишком много файлов")
+            total=0
+            for info in infos:
+                if info.flag_bits & 0x1:
+                    raise HTTPException(400,"Зашифрованные архивы не поддерживаются")
+                total += max(0,int(info.file_size))
+                if total>MAX_ARCHIVE_UNCOMPRESSED_SIZE:
+                    raise HTTPException(413,"Распакованный размер файла слишком большой")
+    except zipfile.BadZipFile:
+        raise HTTPException(400,"Файл повреждён или имеет неверный формат")
 
 def _stored_file_path(path_value: str) -> Path:
     base = UPLOAD_DIR.resolve()
@@ -1541,6 +1564,7 @@ async def upload_file(request:Request):
     if _file_extension(filename) not in ALLOWED_FILE_EXTENSIONS: raise HTTPException(400,"Этот тип файла не поддерживается")
     data=await upload.read()
     if len(data)>MAX_FILE_SIZE: raise HTTPException(413,f"Файл слишком большой. Максимум: {MAX_FILE_SIZE // 1024 // 1024} МБ")
+    _validate_archive_payload(filename,data)
     target=(UPLOAD_DIR/_safe_stored_filename(filename)).resolve()
     try:
         target.relative_to(UPLOAD_DIR.resolve())

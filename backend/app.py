@@ -51,6 +51,7 @@ MAX_FILES_PER_REQUEST = int(os.getenv("MAX_FILES_PER_REQUEST", "20"))
 ALLOWED_FILE_EXTENSIONS = {".pdf",".docx",".txt",".md",".csv",".xls",".xlsx",".ppt",".pptx",".json",".xml",".zip",".png",".jpg",".jpeg",".gif",".webp"}
 GLOBAL_AI_CONCURRENCY = int(os.getenv("GLOBAL_AI_CONCURRENCY", "3"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "300"))
+MAX_FILE_CONTEXT_CHARS = int(os.getenv("MAX_FILE_CONTEXT_CHARS", "500000"))
 AI_SEMAPHORE = threading.BoundedSemaphore(max(1, GLOBAL_AI_CONCURRENCY))
 AUTH_RATE_WINDOW = int(os.getenv("AUTH_RATE_WINDOW", "900"))
 AUTH_LOGIN_LIMIT = int(os.getenv("AUTH_LOGIN_LIMIT", "10"))
@@ -289,7 +290,10 @@ def _stored_file_path(path_value: str) -> Path:
     return resolved
 
 def _read_file_for_ai(row: sqlite3.Row):
-    path=Path(row["path"])
+    try:
+        path=_stored_file_path(row["path"])
+    except HTTPException:
+        return None
     if not path.is_file(): return None
     mime=(row["mime_type"] or mimetypes.guess_type(row["filename"])[0] or "application/octet-stream").lower()
     ext=_file_extension(row["filename"])
@@ -332,6 +336,7 @@ def _read_file_for_ai(row: sqlite3.Row):
 def _chat_ai_messages(db: sqlite3.Connection, chat_id: int):
     rows=db.execute("SELECT id,role,content FROM messages WHERE chat_id=? ORDER BY created_at ASC,id ASC",(chat_id,)).fetchall()
     result=[]
+    file_context_used=0
     for row in rows:
         if row["role"]!="user":
             result.append({"role":row["role"],"content":row["content"]})
@@ -340,8 +345,23 @@ def _chat_ai_messages(db: sqlite3.Connection, chat_id: int):
         parts=[]
         if row["content"]: parts.append({"type":"text","text":row["content"]})
         for file_row in files:
+            if file_context_used >= MAX_FILE_CONTEXT_CHARS:
+                parts.append({"type":"text","text":"[Дополнительные файлы пропущены: достигнут лимит контекста вложений.]"})
+                break
             part=_read_file_for_ai(file_row)
-            if part: parts.append(part)
+            if not part: continue
+            if part.get("type")=="text":
+                text_value=str(part.get("text",""))
+                remaining=max(0,MAX_FILE_CONTEXT_CHARS-file_context_used)
+                if len(text_value)>remaining:
+                    text_value=text_value[:remaining]+ "\n[Содержимое файла обрезано из-за общего лимита контекста вложений.]"
+                file_context_used += len(text_value)
+                part={"type":"text","text":text_value}
+            elif part.get("type")=="image_url":
+                # Image payload size is bounded by the normal upload limit; count a conservative
+                # representation budget so a chat with many images cannot grow without bound.
+                file_context_used += min(int(file_row["size"]),MAX_FILE_CONTEXT_CHARS-file_context_used)
+            parts.append(part)
         result.append({"role":"user","content":parts if len(parts)>1 else (parts[0]["text"] if parts and parts[0]["type"]=="text" else parts)})
     return result
 

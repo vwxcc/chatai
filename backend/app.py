@@ -1543,8 +1543,12 @@ def download_file(file_id:int,request:Request):
     user=current_user(request)
     with closing(get_db()) as db:
         row=db.execute("SELECT path,filename,mime_type FROM files WHERE id=? AND user_id=?",(file_id,user["id"])).fetchone()
-    if row is None or not Path(row["path"]).is_file(): raise HTTPException(404,"Файл не найден")
-    return FileResponse(row["path"],media_type=row["mime_type"] or "application/octet-stream",filename=row["filename"])
+    if row is None:
+        raise HTTPException(404,"Файл не найден")
+    path=_stored_file_path(row["path"])
+    if not path.is_file():
+        raise HTTPException(404,"Файл не найден")
+    return FileResponse(str(path),media_type=row["mime_type"] or "application/octet-stream",filename=row["filename"])
 
 @app.delete("/api/files/{file_id}")
 def delete_file(file_id:int,request:Request):

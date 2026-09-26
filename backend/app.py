@@ -1150,7 +1150,7 @@ def update_provider(provider_id:int,payload:ProviderUpdateRequest,request:Reques
         base_url=payload.base_url.strip() if payload.base_url is not None else row["base_url"]
         api_key_env=payload.api_key_env if payload.api_key_env is not None else row["api_key_env"]
         enabled=int(payload.enabled) if payload.enabled is not None else row["enabled"]
-        if not name or not base_url: raise HTTPException(400,"Название и URL провайдера обязательны")
+        if not name or not base_url: raise HTTPException(400,"Название и URL провайдера обязательны")\n        base_url=base_url.rstrip("/")\n        if not (base_url.startswith("http://") or base_url.startswith("https://")): raise HTTPException(400,"Base URL должен начинаться с http:// или https://")\n        if api_key_env is not None: api_key_env=api_key_env.strip() or None
         try:
             db.execute("UPDATE providers SET name=?,base_url=?,api_key_env=?,enabled=?,updated_at=? WHERE id=?",(name,base_url,api_key_env,enabled,now_iso(),provider_id))
             db.commit()

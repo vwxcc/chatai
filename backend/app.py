@@ -864,9 +864,6 @@ def create_request(payload:MessageRequest,request:Request,background_tasks:Backg
             if len(files)!=len(payload.file_ids): raise HTTPException(404,"Один или несколько файлов не найдены")
             if sum(int(x["size"]) for x in files)>MAX_TOTAL_FILE_SIZE:
                 raise HTTPException(413,f"Общий размер файлов слишком большой. Максимум: {MAX_TOTAL_FILE_SIZE // 1024 // 1024} МБ")
-        # Reserve the generation slot before changing chat history.
-        # The partial UNIQUE index makes this atomic even if two requests arrive together.
-        request_id=create_ai_request(int(user["id"]),payload.chat_id,"main_generation",None)
         ts=now_iso()
         if payload.edit_message_id is not None:
             target=db.execute("SELECT id FROM messages WHERE id=? AND chat_id=? AND user_id=? AND role='user'",(payload.edit_message_id,payload.chat_id,user["id"])).fetchone()
@@ -874,6 +871,7 @@ def create_request(payload:MessageRequest,request:Request,background_tasks:Backg
                 raise HTTPException(404,"Редактируемое сообщение не найдено")
             if payload.parent_message_id is not None and int(payload.parent_message_id)==int(payload.edit_message_id):
                 raise HTTPException(400,"Сообщение не может быть родителем самого себя")
+            request_id=create_ai_request(int(user["id"]),payload.chat_id,"main_generation",None)
             db.execute("DELETE FROM messages WHERE chat_id=? AND id>?",(payload.chat_id,payload.edit_message_id))
             db.execute("UPDATE messages SET content=?,parent_message_id=? WHERE id=?",(content,payload.parent_message_id,payload.edit_message_id))
             db.execute("DELETE FROM message_files WHERE message_id=?",(payload.edit_message_id,))
@@ -881,6 +879,7 @@ def create_request(payload:MessageRequest,request:Request,background_tasks:Backg
                 db.executemany("INSERT INTO message_files(message_id,file_id) VALUES(?,?)",[(payload.edit_message_id,int(x["id"])) for x in files])
             user_message_id=int(payload.edit_message_id)
         else:
+            request_id=create_ai_request(int(user["id"]),payload.chat_id,"main_generation",None)
             cur=db.execute("INSERT INTO messages(chat_id,user_id,role,content,parent_message_id,created_at) VALUES(?,?, 'user',?,?,?)",(payload.chat_id,user["id"],content,payload.parent_message_id,ts))
             if files:
                 db.executemany("INSERT INTO message_files(message_id,file_id) VALUES(?,?)",[(int(cur.lastrowid),int(x["id"])) for x in files])
@@ -1094,9 +1093,6 @@ def stream_request(payload:MessageRequest,request:Request,background_tasks:Backg
             if len(files)!=len(payload.file_ids): raise HTTPException(404,"Один или несколько файлов не найдены")
             if sum(int(x["size"]) for x in files)>MAX_TOTAL_FILE_SIZE:
                 raise HTTPException(413,f"Общий размер файлов слишком большой. Максимум: {MAX_TOTAL_FILE_SIZE // 1024 // 1024} МБ")
-        # Reserve the generation slot before changing chat history.
-        # The partial UNIQUE index makes this atomic even if two requests arrive together.
-        request_id=create_ai_request(int(user["id"]),payload.chat_id,"main_generation",None)
         ts=now_iso()
         if payload.edit_message_id is not None:
             target=db.execute("SELECT id FROM messages WHERE id=? AND chat_id=? AND user_id=? AND role='user'",(payload.edit_message_id,payload.chat_id,user["id"])).fetchone()
@@ -1104,6 +1100,7 @@ def stream_request(payload:MessageRequest,request:Request,background_tasks:Backg
                 raise HTTPException(404,"Редактируемое сообщение не найдено")
             if payload.parent_message_id is not None and int(payload.parent_message_id)==int(payload.edit_message_id):
                 raise HTTPException(400,"Сообщение не может быть родителем самого себя")
+            request_id=create_ai_request(int(user["id"]),payload.chat_id,"main_generation",None)
             db.execute("DELETE FROM messages WHERE chat_id=? AND id>?",(payload.chat_id,payload.edit_message_id))
             db.execute("UPDATE messages SET content=?,parent_message_id=? WHERE id=?",(content,payload.parent_message_id,payload.edit_message_id))
             db.execute("DELETE FROM message_files WHERE message_id=?",(payload.edit_message_id,))
@@ -1111,6 +1108,7 @@ def stream_request(payload:MessageRequest,request:Request,background_tasks:Backg
                 db.executemany("INSERT INTO message_files(message_id,file_id) VALUES(?,?)",[(payload.edit_message_id,int(x["id"])) for x in files])
             user_message_id=int(payload.edit_message_id)
         else:
+            request_id=create_ai_request(int(user["id"]),payload.chat_id,"main_generation",None)
             cur=db.execute("INSERT INTO messages(chat_id,user_id,role,content,parent_message_id,created_at) VALUES(?,?, 'user',?,?,?)",(payload.chat_id,user["id"],content,payload.parent_message_id,ts))
             if files:
                 db.executemany("INSERT INTO message_files(message_id,file_id) VALUES(?,?)",[(int(cur.lastrowid),int(x["id"])) for x in files])

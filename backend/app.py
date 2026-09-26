@@ -1141,8 +1141,15 @@ def branch_message(message_id:int,request:Request):
             new_parent=idmap.get(old["parent_message_id"])
             c=db.execute("INSERT INTO messages(chat_id,user_id,role,content,model,provider,routing_set,parent_message_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(new_chat_id,user["id"],old["role"],old["content"],old["model"],old["provider"],old["routing_set"],new_parent,old["created_at"]))
             idmap[int(old["id"])]=int(c.lastrowid)
-            files=db.execute("SELECT file_id FROM message_files WHERE message_id=?",(old["id"],)).fetchall()
-            db.executemany("INSERT INTO message_files(message_id,file_id) VALUES(?,?)",[(int(c.lastrowid),int(x["file_id"])) for x in files])
+            files=db.execute(
+                "SELECT mf.file_id FROM message_files mf JOIN files f ON f.id=mf.file_id "
+                "WHERE mf.message_id=? AND f.user_id=?",
+                (old["id"],user["id"])
+            ).fetchall()
+            db.executemany(
+                "INSERT INTO message_files(message_id,file_id) VALUES(?,?)",
+                [(int(c.lastrowid),int(x["file_id"])) for x in files]
+            )
         db.commit()
     return {"chat_id":new_chat_id}
 

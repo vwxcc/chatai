@@ -1316,6 +1316,8 @@ def create_provider(payload:ProviderRequest,request:Request):
     name=payload.name.strip()
     base_url=payload.base_url.strip().rstrip("/")
     api_key_env=payload.api_key_env.strip() if payload.api_key_env else None
+    if api_key_env and not __import__("re").fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", api_key_env):
+        raise HTTPException(400,"Некорректное имя переменной API-ключа")
     if not name or not base_url:
         raise HTTPException(400,"Название и URL провайдера обязательны")
     if not (base_url.startswith("http://") or base_url.startswith("https://")):
@@ -1343,7 +1345,10 @@ def update_provider(provider_id:int,payload:ProviderUpdateRequest,request:Reques
         if not name or not base_url: raise HTTPException(400,"Название и URL провайдера обязательны")
         base_url=base_url.rstrip("/")
         if not (base_url.startswith("http://") or base_url.startswith("https://")): raise HTTPException(400,"Base URL должен начинаться с http:// или https://")
-        if api_key_env is not None: api_key_env=api_key_env.strip() or None
+        if api_key_env is not None:
+            api_key_env=api_key_env.strip() or None
+            if api_key_env and not __import__("re").fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", api_key_env):
+                raise HTTPException(400,"Некорректное имя переменной API-ключа")
         try:
             db.execute("UPDATE providers SET name=?,base_url=?,api_key_env=?,enabled=?,updated_at=? WHERE id=?",(name,base_url,api_key_env,enabled,now_iso(),provider_id))
             db.commit()

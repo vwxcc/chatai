@@ -1142,10 +1142,17 @@ def list_providers(request:Request):
 @app.post("/api/routing/providers")
 def create_provider(payload:ProviderRequest,request:Request):
     require_admin(request)
+    name=payload.name.strip()
+    base_url=payload.base_url.strip().rstrip("/")
+    api_key_env=payload.api_key_env.strip() if payload.api_key_env else None
+    if not name or not base_url:
+        raise HTTPException(400,"Название и URL провайдера обязательны")
+    if not (base_url.startswith("http://") or base_url.startswith("https://")):
+        raise HTTPException(400,"Base URL должен начинаться с http:// или https://")
     ts=now_iso()
     with closing(get_db()) as db:
         try:
-            cur=db.execute("INSERT INTO providers(name,base_url,api_key_env,created_at,updated_at) VALUES(?,?,?,?,?)",(payload.name.strip(),payload.base_url.strip().rstrip("/"),payload.api_key_env.strip() if payload.api_key_env else None,ts,ts))
+            cur=db.execute("INSERT INTO providers(name,base_url,api_key_env,created_at,updated_at) VALUES(?,?,?,?,?)",(name,base_url,api_key_env,ts,ts))
             db.commit()
         except sqlite3.IntegrityError:
             raise HTTPException(409,"Провайдер с таким названием уже существует")

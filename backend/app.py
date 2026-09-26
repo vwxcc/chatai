@@ -1135,10 +1135,17 @@ def stream_request(payload:MessageRequest,request:Request,background_tasks:Backg
                 ts=now_iso()
                 cur=db.execute("INSERT INTO messages(chat_id,user_id,role,content,model,provider,routing_set,parent_message_id,created_at) VALUES(?,?, 'assistant',?,?,?,?,?,?,?)",(payload.chat_id,user["id"],final_content,selected["model"],selected["provider"],str(selected["routing_set_id"]),user_message_id,ts))
                 db.execute("UPDATE chats SET updated_at=? WHERE id=? AND user_id=?",(ts,payload.chat_id,user["id"]))
+                completion=db.execute(
+                    "UPDATE ai_requests SET status='completed',message_id=?,provider=?,model=?,routing_set=?,fallback_attempts_json=?,completed_at=? "
+                    "WHERE id=? AND status='processing' AND cancel_requested=0",
+                    (int(cur.lastrowid),selected["provider"],selected["model"],str(selected["routing_set_id"]),json.dumps(selected.get("fallback_attempts",[]),ensure_ascii=False),ts,request_id)
+                )
+                if completion.rowcount != 1:
+                    db.rollback()
+                    raise RuntimeError("REQUEST_CANCELLED")
                 db.commit()
                 assistant=db.execute("SELECT id,chat_id,user_id,role,content,model,provider,routing_set,parent_message_id,created_at FROM messages WHERE id=?",(cur.lastrowid,)).fetchone()
                 user_message=db.execute("SELECT id,chat_id,user_id,role,content,model,provider,routing_set,parent_message_id,created_at FROM messages WHERE id=?",(user_message_id,)).fetchone()
-            update_ai_request(request_id,status="completed",message_id=int(assistant["id"]),provider=selected["provider"],model=selected["model"],routing_set=str(selected["routing_set_id"]),fallback_attempts_json=json.dumps(selected.get("fallback_attempts",[]),ensure_ascii=False),completed_at=now_iso())
             background_tasks.add_task(_run_post_response_tasks,payload.chat_id,int(user["id"]))
             yield event({"type":"complete","request_id":request_id,"message":dict(assistant),"user_message":dict(user_message)})
         except RuntimeError as exc:

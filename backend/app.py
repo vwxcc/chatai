@@ -737,6 +737,17 @@ def rename_chat(chat_id:int,payload:RenameChatRequest,request:Request):
         chat=get_owned_chat(db,chat_id,int(user["id"]))
     return {"chat":dict(chat)}
 
+@app.patch("/api/chats/{chat_id}/archive")
+def archive_chat(chat_id:int,request:Request):
+    user=current_user(request)
+    with closing(get_db()) as db:
+        chat=get_owned_chat(db,chat_id,int(user["id"]))
+        archived=0 if int(chat["archived"]) else 1
+        db.execute("UPDATE chats SET archived=?,updated_at=? WHERE id=? AND user_id=?",(archived,now_iso(),chat_id,user["id"]))
+        db.commit()
+        chat=get_owned_chat(db,chat_id,int(user["id"]))
+    return {"chat":dict(chat)}
+
 @app.delete("/api/chats/{chat_id}")
 def delete_chat(chat_id:int,request:Request):
     user=current_user(request)
@@ -755,8 +766,8 @@ def search(request:Request,q:str=""):
     like="%" + query + "%"
     with closing(get_db()) as db:
         rows=db.execute(
-            "SELECT c.id AS chat_id,c.title AS chat_title,m.id AS message_id,m.role,m.content,m.created_at FROM messages m JOIN chats c ON c.id=m.chat_id WHERE c.user_id=? AND (c.title LIKE ? OR m.content LIKE ?) ORDER BY m.created_at DESC LIMIT 50",
-            (user["id"],like,like)
+            "SELECT DISTINCT c.id AS chat_id,c.title AS chat_title,m.id AS message_id,m.role,m.content,m.created_at FROM messages m JOIN chats c ON c.id=m.chat_id LEFT JOIN message_files mf ON mf.message_id=m.id LEFT JOIN files f ON f.id=mf.file_id WHERE c.user_id=? AND (c.title LIKE ? OR m.content LIKE ? OR f.filename LIKE ?) ORDER BY m.created_at DESC LIMIT 50",
+            (user["id"],like,like,like)
         ).fetchall()
     return {"results":[dict(x) for x in rows]}
 

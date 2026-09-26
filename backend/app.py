@@ -672,6 +672,16 @@ def update_ai_request(request_id:int,**values):
         db.execute("UPDATE ai_requests SET "+",".join(parts)+" WHERE id=?",params)
         db.commit()
 
+def mark_ai_request_processing(request_id:int):
+    with closing(get_db()) as db:
+        cur=db.execute(
+            "UPDATE ai_requests SET status='processing',started_at=? WHERE id=? AND status='queued' AND cancel_requested=0",
+            (now_iso(),request_id)
+        )
+        db.commit()
+        if cur.rowcount != 1:
+            raise RuntimeError("REQUEST_CANCELLED")
+
 def ai_request_owned(db,request_id:int,user_id:int):
     row=db.execute("SELECT * FROM ai_requests WHERE id=? AND user_id=?",(request_id,user_id)).fetchone()
     if row is None: raise HTTPException(404,"Запрос не найден")
@@ -1055,7 +1065,10 @@ def create_request(payload:MessageRequest,request:Request,background_tasks:Backg
             db.rollback()
             update_ai_request(request_id,status="failed",error="Не удалось сохранить сообщение",completed_at=now_iso())
             raise
-    update_ai_request(request_id,message_id=user_message_id,status="processing",started_at=now_iso())
+    try:
+        mark_ai_request_processing(request_id)
+    except RuntimeError:
+        raise HTTPException(409,"Запрос уже остановлен")
     with closing(get_db()) as db:
         ai_messages=_chat_ai_messages(db,payload.chat_id)
     try:

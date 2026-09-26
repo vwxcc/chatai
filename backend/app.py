@@ -1026,7 +1026,7 @@ def retry_message(message_id:int,request:Request):
     with closing(get_db()) as db:
         row=db.execute("SELECT m.*,c.user_id FROM messages m JOIN chats c ON c.id=m.chat_id WHERE m.id=? AND m.role='assistant'",(message_id,)).fetchone()
         if row is None or int(row["user_id"])!=int(user["id"]): raise HTTPException(404,"Ответ не найден")
-        parent=db.execute("SELECT * FROM messages WHERE chat_id=? AND id<? ORDER BY id DESC LIMIT 1",(row["chat_id"],row["id"])).fetchone()
+        parent=db.execute("SELECT * FROM messages WHERE id=? AND chat_id=? AND user_id=? AND role='user'",(row["parent_message_id"],row["chat_id"],user["id"])).fetchone() if row["parent_message_id"] is not None else db.execute("SELECT * FROM messages WHERE chat_id=? AND id<? AND user_id=? AND role='user' ORDER BY id DESC LIMIT 1",(row["chat_id"],row["id"],user["id"])).fetchone()
         if parent is None or parent["role"]!="user": raise HTTPException(400,"Перед ответом не найден запрос пользователя")
         files=db.execute("SELECT file_id FROM message_files WHERE message_id=? ORDER BY file_id",(parent["id"],)).fetchall()
         payload={"chat_id":int(row["chat_id"]),"content":parent["content"],"parent_message_id":int(parent["id"]),"file_ids":[int(x["file_id"]) for x in files]}

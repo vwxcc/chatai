@@ -1115,6 +1115,11 @@ def list_chat_requests(chat_id:int,request:Request):
         rows=db.execute("SELECT * FROM ai_requests WHERE chat_id=? AND user_id=? ORDER BY created_at DESC LIMIT 50",(chat_id,user["id"])).fetchall()
     return {"requests":[dict(x) for x in rows]}
 
+@app.get("/api/routing/access")
+def routing_access(request:Request):
+    user=current_user(request)
+    return {"is_admin": bool(ADMIN_EMAILS and str(user["email"]).lower() in ADMIN_EMAILS)}
+
 @app.get("/api/routing/providers")
 def list_providers(request:Request):
     require_admin(request)

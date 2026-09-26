@@ -16,18 +16,18 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
+from pydantic import BaseModel, Field
+from starlette.middleware.sessions import SessionMiddleware
+
 def require_admin(request:Request):
     user=current_user(request)
     if not ADMIN_EMAILS or str(user["email"]).lower() not in ADMIN_EMAILS:
         raise HTTPException(403,"Требуются права администратора")
     return user
 
-
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
-from pydantic import BaseModel, Field
-from starlette.middleware.sessions import SessionMiddleware
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent

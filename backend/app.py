@@ -1056,7 +1056,7 @@ def retry_message(message_id:int,request:Request):
         if parent is None or parent["role"]!="user": raise HTTPException(400,"Перед ответом не найден запрос пользователя")
         files=db.execute("SELECT file_id FROM message_files WHERE message_id=? ORDER BY file_id",(parent["id"],)).fetchall()
         payload={"chat_id":int(row["chat_id"]),"content":parent["content"],"parent_message_id":int(parent["id"]),"file_ids":[int(x["file_id"]) for x in files]}
-    return {"chat_id":payload["chat_id"],"content":payload["content"],"parent_message_id":payload["parent_message_id"]}
+    return {"chat_id":payload["chat_id"],"content":payload["content"],"parent_message_id":payload["parent_message_id"],"file_ids":payload["file_ids"]}
 
 @app.post("/api/requests/stream")
 def stream_request(payload:MessageRequest,request:Request,background_tasks:BackgroundTasks):

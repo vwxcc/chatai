@@ -1338,6 +1338,7 @@ def stream_request(payload:MessageRequest,request:Request,background_tasks:Backg
     def generate_events():
         full_content=[]
         selected=None
+        terminal=False
         try:
             yield event({"type":"start","request_id":request_id})
             for item in MODEL_ROUTER.stream_generate("main_generation",ai_messages,cancel_check=lambda: is_ai_request_cancelled(request_id),request_id=request_id):
@@ -1371,14 +1372,20 @@ def stream_request(payload:MessageRequest,request:Request,background_tasks:Backg
                 assistant=db.execute("SELECT id,chat_id,user_id,role,content,model,provider,routing_set,parent_message_id,created_at FROM messages WHERE id=?",(cur.lastrowid,)).fetchone()
                 user_message=db.execute("SELECT id,chat_id,user_id,role,content,model,provider,routing_set,parent_message_id,created_at FROM messages WHERE id=?",(user_message_id,)).fetchone()
             background_tasks.add_task(_run_post_response_tasks,payload.chat_id,int(user["id"]))
+            terminal=True
             yield event({"type":"complete","request_id":request_id,"message":dict(assistant),"user_message":dict(user_message)})
         except RuntimeError as exc:
             status="cancelled" if str(exc)=="REQUEST_CANCELLED" else "failed"
             update_ai_request(request_id,status=status,error=str(exc),completed_at=now_iso())
+            terminal=True
             yield event({"type":"cancelled" if status=="cancelled" else "error","request_id":request_id,"error":str(exc)})
         except Exception as exc:
             update_ai_request(request_id,status="failed",error=str(exc)[:500],completed_at=now_iso())
+            terminal=True
             yield event({"type":"error","request_id":request_id,"error":"Запрос не выполнен"})
+        finally:
+            if not terminal:
+                update_ai_request(request_id,status="cancelled",cancel_requested=1,error="Клиентское соединение прервано",completed_at=now_iso())
 
     return StreamingResponse(generate_events(),media_type="text/event-stream",headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 

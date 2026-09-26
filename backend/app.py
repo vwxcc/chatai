@@ -166,6 +166,7 @@ def init_db() -> None:
             created_at TEXT NOT NULL,
             started_at TEXT,
             completed_at TEXT,
+            cancel_requested INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
             FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE,
             FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE SET NULL
@@ -176,6 +177,9 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_ai_requests_user_created ON ai_requests(user_id,created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_ai_requests_chat_created ON ai_requests(chat_id,created_at DESC);
         """)
+        columns = {row["name"] for row in db.execute("PRAGMA table_info(ai_requests)").fetchall()}
+        if "cancel_requested" not in columns:
+            db.execute("ALTER TABLE ai_requests ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
         db.commit()
 
 def hash_password(password: str) -> str:
@@ -320,6 +324,8 @@ class ModelRouter:
                 started=time_monotonic()
                 try:
                     content=self._request(model,messages)
+                    if cancel_check and cancel_check():
+                        raise RuntimeError("REQUEST_CANCELLED")
                     attempts.append({"provider":model["provider_name"],"model":model["model_name"],"status":"success","duration_ms":int((time_monotonic()-started)*1000)})
                     return {"content":content,"model":model["model_name"],"provider":model["provider_name"],"routing_set_id":routing_set_id,"fallback_attempts":attempts}
                 except Exception as exc:
@@ -338,10 +344,17 @@ def create_ai_request(user_id:int,chat_id:int,task_key:str,message_id=None):
         db.commit()
         return int(cur.lastrowid)
 
+def is_ai_request_cancelled(request_id:int) -> bool:
+    with closing(get_db()) as db:
+        row=db.execute("SELECT status,cancel_requested FROM ai_requests WHERE id=?",(request_id,)).fetchone()
+    if row is None:
+        return False
+    return bool(row["cancel_requested"]) or row["status"] == "cancelled"
+
 def update_ai_request(request_id:int,**values):
     if not values:
         return
-    allowed={"status","error","provider","model","routing_set","fallback_attempts_json","message_id","started_at","completed_at"}
+    allowed={"status","error","provider","model","routing_set","fallback_attempts_json","message_id","started_at","completed_at","cancel_requested"}
     values={k:v for k,v in values.items() if k in allowed}
     if not values: return
     parts=[k+"=?" for k in values]
@@ -562,7 +575,7 @@ def create_request(payload:MessageRequest,request:Request,background_tasks:Backg
     ai_messages=[{"role":row["role"],"content":row["content"]} for row in history]
     ai_messages.append({"role":"user","content":content})
     try:
-        result=MODEL_ROUTER.generate("main_generation",ai_messages,request_id=request_id)
+        result=MODEL_ROUTER.generate("main_generation",ai_messages,cancel_check=lambda: is_ai_request_cancelled(request_id),request_id=request_id)
     except HTTPException as exc:
         update_ai_request(request_id,status="failed",error=str(exc.detail),completed_at=now_iso())
         raise
@@ -657,12 +670,43 @@ def change_routing_model_priority(routing_set_id:int,model_config_id:int,payload
         db.commit()
     return {"ok":True}
 
+@app.post("/api/requests/{request_id}/cancel")
+def cancel_request(request_id:int,request:Request):
+    user=current_user(request)
+    with closing(get_db()) as db:
+        row=ai_request_owned(db,request_id,int(user["id"]))
+        status=row["status"]
+        if status in {"completed","failed","cancelled"}:
+            data=dict(row)
+        elif status == "queued":
+            ts=now_iso()
+            db.execute(
+                "UPDATE ai_requests SET status='cancelled',cancel_requested=1,completed_at=? WHERE id=? AND user_id=?",
+                (ts,request_id,user["id"])
+            )
+            db.commit()
+            data=dict(ai_request_owned(db,request_id,int(user["id"])))
+        else:
+            db.execute(
+                "UPDATE ai_requests SET cancel_requested=1 WHERE id=? AND user_id=?",
+                (request_id,user["id"])
+            )
+            db.commit()
+            data=dict(ai_request_owned(db,request_id,int(user["id"])))
+    return {
+        "request_id":request_id,
+        "status":data["status"],
+        "cancel_requested":bool(data["cancel_requested"]),
+        "request":data
+    }
+
 @app.get("/api/requests/{request_id}")
 def get_request_status(request_id:int,request:Request):
     user=current_user(request)
     with closing(get_db()) as db:
         row=ai_request_owned(db,request_id,int(user["id"]))
     data=dict(row)
+    data["cancel_requested"]=bool(data.get("cancel_requested"))
     if data.get("fallback_attempts_json"):
         try: data["fallback_attempts"]=json.loads(data["fallback_attempts_json"])
         except Exception: data["fallback_attempts"]=[]

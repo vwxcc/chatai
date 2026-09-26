@@ -1122,6 +1122,9 @@ def stream_request(payload:MessageRequest,request:Request,background_tasks:Backg
                     full_content.append(item["content"])
                     yield event(item)
                 elif item_type=="fallback":
+                    # A failed streaming model may already have emitted partial text.
+                    # The fallback response must replace it, not append to it.
+                    full_content.clear()
                     yield event(item)
                 elif item_type=="done":
                     selected=item

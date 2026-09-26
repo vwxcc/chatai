@@ -827,6 +827,10 @@ def create_request(payload:MessageRequest,request:Request,background_tasks:Backg
         raise HTTPException(400,"Сообщение не может быть пустым")
     with closing(get_db()) as db:
         get_owned_chat(db,payload.chat_id,int(user["id"]))
+        if payload.parent_message_id is not None:
+            parent=db.execute("SELECT id FROM messages WHERE id=? AND chat_id=? AND user_id=?",(payload.parent_message_id,payload.chat_id,user["id"])).fetchone()
+            if parent is None:
+                raise HTTPException(404,"Родительское сообщение не найдено")
         if len(set(payload.file_ids)) != len(payload.file_ids):
             raise HTTPException(400,"Файлы указаны повторно")
         files=[]
@@ -981,7 +985,10 @@ def edit_message(message_id:int,payload:MessageRequest,request:Request):
         row=db.execute("SELECT m.*,c.user_id FROM messages m JOIN chats c ON c.id=m.chat_id WHERE m.id=? AND m.role='user'",(message_id,)).fetchone()
         if row is None or int(row["user_id"])!=int(user["id"]): raise HTTPException(404,"Сообщение не найдено")
         if not payload.content and not payload.file_ids: raise HTTPException(400,"Сообщение не может быть пустым")
-        db.execute("UPDATE messages SET content=?,parent_message_id=? WHERE id=?",(payload.content,message_id,message_id))
+        if payload.parent_message_id is not None:
+            parent=db.execute("SELECT id FROM messages WHERE id=? AND chat_id=? AND user_id=?",(payload.parent_message_id,row["chat_id"],user["id"])).fetchone()
+            if parent is None: raise HTTPException(404,"Родительское сообщение не найдено")
+        db.execute("UPDATE messages SET content=?,parent_message_id=? WHERE id=?",(payload.content,payload.parent_message_id,message_id))
         db.execute("DELETE FROM message_files WHERE message_id=?",(message_id,))
         if payload.file_ids:
             placeholders=",".join("?" for _ in payload.file_ids)
@@ -1021,7 +1028,8 @@ def retry_message(message_id:int,request:Request):
         if row is None or int(row["user_id"])!=int(user["id"]): raise HTTPException(404,"Ответ не найден")
         parent=db.execute("SELECT * FROM messages WHERE chat_id=? AND id<? ORDER BY id DESC LIMIT 1",(row["chat_id"],row["id"])).fetchone()
         if parent is None or parent["role"]!="user": raise HTTPException(400,"Перед ответом не найден запрос пользователя")
-        payload={"chat_id":int(row["chat_id"]),"content":parent["content"],"parent_message_id":int(parent["id"]),"file_ids":[]}
+        files=db.execute("SELECT file_id FROM message_files WHERE message_id=? ORDER BY file_id",(parent["id"],)).fetchall()
+        payload={"chat_id":int(row["chat_id"]),"content":parent["content"],"parent_message_id":int(parent["id"]),"file_ids":[int(x["file_id"]) for x in files]}
     return {"chat_id":payload["chat_id"],"content":payload["content"],"parent_message_id":payload["parent_message_id"]}
 
 @app.post("/api/requests/stream")
@@ -1032,6 +1040,10 @@ def stream_request(payload:MessageRequest,request:Request,background_tasks:Backg
         raise HTTPException(400,"Сообщение не может быть пустым")
     with closing(get_db()) as db:
         get_owned_chat(db,payload.chat_id,int(user["id"]))
+        if payload.parent_message_id is not None:
+            parent=db.execute("SELECT id FROM messages WHERE id=? AND chat_id=? AND user_id=?",(payload.parent_message_id,payload.chat_id,user["id"])).fetchone()
+            if parent is None:
+                raise HTTPException(404,"Родительское сообщение не найдено")
         if len(set(payload.file_ids)) != len(payload.file_ids):
             raise HTTPException(400,"Файлы указаны повторно")
         files=[]

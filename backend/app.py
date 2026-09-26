@@ -8,6 +8,8 @@ import json
 import urllib.request
 import threading
 import time
+import base64
+import mimetypes
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +34,10 @@ SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-only-change-me")
 MAX_NAME_LENGTH = int(os.getenv("MAX_NAME_LENGTH", "80"))
 MAX_PROMPT_LENGTH = int(os.getenv("MAX_PROMPT_LENGTH", "30000"))
 MAX_SEARCH_LENGTH = int(os.getenv("MAX_SEARCH_LENGTH", "200"))
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", str(20 * 1024 * 1024)))
+MAX_TOTAL_FILE_SIZE = int(os.getenv("MAX_TOTAL_FILE_SIZE", str(50 * 1024 * 1024)))
+MAX_FILES_PER_REQUEST = int(os.getenv("MAX_FILES_PER_REQUEST", "20"))
+ALLOWED_FILE_EXTENSIONS = {".pdf",".docx",".txt",".md",".csv",".xls",".xlsx",".ppt",".pptx",".json",".xml",".zip",".png",".jpg",".jpeg",".gif",".webp"}
 GLOBAL_AI_CONCURRENCY = int(os.getenv("GLOBAL_AI_CONCURRENCY", "3"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "300"))
 AI_SEMAPHORE = threading.BoundedSemaphore(max(1, GLOBAL_AI_CONCURRENCY))
@@ -208,6 +214,69 @@ def current_user(request: Request) -> sqlite3.Row:
         raise HTTPException(401,"Сессия недействительна")
     return user
 
+def _file_extension(filename: str) -> str:
+    return Path(filename).suffix.lower()
+
+def _safe_stored_filename(filename: str) -> str:
+    return secrets.token_hex(16) + _file_extension(filename)
+
+def _read_file_for_ai(row: sqlite3.Row):
+    path=Path(row["path"])
+    if not path.is_file(): return None
+    mime=(row["mime_type"] or mimetypes.guess_type(row["filename"])[0] or "application/octet-stream").lower()
+    ext=_file_extension(row["filename"])
+    if mime.startswith("image/"):
+        encoded=base64.b64encode(path.read_bytes()).decode("ascii")
+        return {"type":"image_url","image_url":{"url":f"data:{mime};base64,{encoded}"}}
+    try:
+        if ext in {".txt",".md",".csv",".json",".xml"}:
+            text=path.read_text("utf-8",errors="replace")
+            return {"type":"text","text":f"Файл {row['filename']}:\n{text[:200000]}"}
+        if ext==".pdf":
+            from pypdf import PdfReader
+            text="\n".join((page.extract_text() or "") for page in PdfReader(str(path)).pages)
+            return {"type":"text","text":f"Файл {row['filename']} (извлечённый текст):\n{text[:200000]}"}
+        if ext==".docx":
+            from docx import Document
+            text="\n".join(p.text for p in Document(str(path)).paragraphs)
+            return {"type":"text","text":f"Файл {row['filename']} (извлечённый текст):\n{text[:200000]}"}
+        if ext in {".xls",".xlsx"}:
+            from openpyxl import load_workbook
+            wb=load_workbook(str(path),read_only=True,data_only=True)
+            chunks=[]
+            for ws in wb.worksheets:
+                chunks.append(f"[Лист: {ws.title}]")
+                for values in ws.iter_rows(values_only=True):
+                    chunks.append(" | ".join("" if v is None else str(v) for v in values))
+                    if len("\n".join(chunks))>200000: break
+            return {"type":"text","text":f"Файл {row['filename']}:\n" + "\n".join(chunks)[:200000]}
+        if ext in {".ppt",".pptx"}:
+            from pptx import Presentation
+            chunks=[]
+            for slide in Presentation(str(path)).slides:
+                for shape in slide.shapes:
+                    if hasattr(shape,"text") and shape.text: chunks.append(shape.text)
+            return {"type":"text","text":f"Файл {row['filename']} (извлечённый текст):\n" + "\n".join(chunks)[:200000]}
+    except Exception as exc:
+        return {"type":"text","text":f"Файл {row['filename']} не удалось полностью прочитать: {str(exc)[:300]}"}
+    return {"type":"text","text":f"Файл {row['filename']} прикреплён, но его содержимое этого типа пока не извлекается."}
+
+def _chat_ai_messages(db: sqlite3.Connection, chat_id: int):
+    rows=db.execute("SELECT id,role,content FROM messages WHERE chat_id=? ORDER BY created_at ASC,id ASC",(chat_id,)).fetchall()
+    result=[]
+    for row in rows:
+        if row["role"]!="user":
+            result.append({"role":row["role"],"content":row["content"]})
+            continue
+        files=db.execute("SELECT f.id,f.filename,f.mime_type,f.size,f.path FROM message_files mf JOIN files f ON f.id=mf.file_id WHERE mf.message_id=? ORDER BY f.id",(row["id"],)).fetchall()
+        parts=[]
+        if row["content"]: parts.append({"type":"text","text":row["content"]})
+        for file_row in files:
+            part=_read_file_for_ai(file_row)
+            if part: parts.append(part)
+        result.append({"role":"user","content":parts if len(parts)>1 else (parts[0]["text"] if parts and parts[0]["type"]=="text" else parts)})
+    return result
+
 def get_owned_chat(db: sqlite3.Connection, chat_id: int, user_id: int) -> sqlite3.Row:
     chat = db.execute(
         "SELECT id,user_id,title,archived,created_at,updated_at FROM chats WHERE id=? AND user_id=?",
@@ -234,8 +303,9 @@ class RenameChatRequest(BaseModel):
 
 class MessageRequest(BaseModel):
     chat_id: int
-    content: str = Field(min_length=1,max_length=MAX_PROMPT_LENGTH)
+    content: str = Field(default="",max_length=MAX_PROMPT_LENGTH)
     parent_message_id: int | None = None
+    file_ids: list[int] = Field(default_factory=list,max_length=MAX_FILES_PER_REQUEST)
 
 class RoutingSetRequest(BaseModel):
     name: str = Field(min_length=1,max_length=120)
@@ -781,7 +851,7 @@ def cancel_request(request_id:int,request:Request):
 def stream_request(payload:MessageRequest,request:Request,background_tasks:BackgroundTasks):
     user=current_user(request)
     content=payload.content.strip()
-    if not content:
+    if not content and not payload.file_ids:
         raise HTTPException(400,"Сообщение не может быть пустым")
     with closing(get_db()) as db:
         get_owned_chat(db,payload.chat_id,int(user["id"]))
@@ -1042,6 +1112,48 @@ def list_task_routes(request:Request):
     with closing(get_db()) as db:
         rows=db.execute("SELECT tr.task_key,tr.routing_set_id,rs.name AS routing_set_name,tr.updated_at FROM task_routes tr LEFT JOIN routing_sets rs ON rs.id=tr.routing_set_id ORDER BY tr.task_key").fetchall()
     return {"tasks":[dict(x) for x in rows]}
+
+@app.post("/api/files")
+async def upload_file(request:Request):
+    user=current_user(request)
+    form=await request.form()
+    upload=form.get("file")
+    if upload is None or not getattr(upload,"filename",None): raise HTTPException(400,"Файл не выбран")
+    filename=Path(str(upload.filename)).name
+    if _file_extension(filename) not in ALLOWED_FILE_EXTENSIONS: raise HTTPException(400,"Этот тип файла не поддерживается")
+    data=await upload.read()
+    if len(data)>MAX_FILE_SIZE: raise HTTPException(413,f"Файл слишком большой. Максимум: {MAX_FILE_SIZE // 1024 // 1024} МБ")
+    target=UPLOAD_DIR/_safe_stored_filename(filename)
+    target.write_bytes(data)
+    mime=upload.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    try:
+        with closing(get_db()) as db:
+            cur=db.execute("INSERT INTO files(user_id,filename,stored_filename,mime_type,size,path,created_at) VALUES(?,?,?,?,?,?,?)",(user["id"],filename,target.name,mime,len(data),str(target),now_iso()))
+            db.commit()
+            row=db.execute("SELECT id,filename,mime_type,size,created_at FROM files WHERE id=?",(cur.lastrowid,)).fetchone()
+        return {"file":dict(row)}
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+
+@app.get("/api/files/{file_id}/download")
+def download_file(file_id:int,request:Request):
+    user=current_user(request)
+    with closing(get_db()) as db:
+        row=db.execute("SELECT path,filename,mime_type FROM files WHERE id=? AND user_id=?",(file_id,user["id"])).fetchone()
+    if row is None or not Path(row["path"]).is_file(): raise HTTPException(404,"Файл не найден")
+    return FileResponse(row["path"],media_type=row["mime_type"] or "application/octet-stream",filename=row["filename"])
+
+@app.delete("/api/files/{file_id}")
+def delete_file(file_id:int,request:Request):
+    user=current_user(request)
+    with closing(get_db()) as db:
+        row=db.execute("SELECT path FROM files WHERE id=? AND user_id=?",(file_id,user["id"])).fetchone()
+        if row is None: raise HTTPException(404,"Файл не найден")
+        db.execute("DELETE FROM files WHERE id=? AND user_id=?",(file_id,user["id"]))
+        db.commit()
+    Path(row["path"]).unlink(missing_ok=True)
+    return {"ok":True}
 
 @app.get("/api/files")
 def list_files(request:Request,q:str=""):

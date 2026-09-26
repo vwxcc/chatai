@@ -952,7 +952,7 @@ def _normalize_routing_priorities(db, routing_set_id):
 
 @app.patch("/api/routing/sets/{routing_set_id}")
 def update_routing_set(routing_set_id:int,payload:RoutingSetUpdateRequest,request:Request):
-    current_user(request)
+    require_admin(request)
     with closing(get_db()) as db:
         row=db.execute("SELECT id,name,description,created_at,updated_at FROM routing_sets WHERE id=?",(routing_set_id,)).fetchone()
         if row is None: raise HTTPException(404,"Набор маршрутизации не найден")

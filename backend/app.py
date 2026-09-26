@@ -314,6 +314,13 @@ class ShareUpdateRequest(BaseModel):
 class RenameChatRequest(BaseModel):
     title: str = Field(min_length=1,max_length=200)
 
+class ProfileUpdateRequest(BaseModel):
+    name: str = Field(min_length=1,max_length=MAX_NAME_LENGTH)
+
+class PasswordUpdateRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8,max_length=256)
+
 class MessageRequest(BaseModel):
     chat_id: int
     content: str = Field(default="",max_length=MAX_PROMPT_LENGTH)
@@ -611,6 +618,26 @@ def login(payload:LoginRequest,request:Request):
         raise HTTPException(401,"Неверный email или пароль")
     request.session["user_id"]=int(user["id"])
     return {"user":{"id":int(user["id"]),"email":user["email"],"name":user["name"]}}
+
+@app.patch("/api/auth/profile")
+def update_profile(payload:ProfileUpdateRequest,request:Request):
+    user=current_user(request)
+    name=payload.name.strip()
+    if not name: raise HTTPException(400,"Имя не может быть пустым")
+    with closing(get_db()) as db:
+        db.execute("UPDATE users SET name=?,updated_at=? WHERE id=?",(name,now_iso(),user["id"]))
+        db.commit()
+        row=db.execute("SELECT id,email,name,created_at,updated_at FROM users WHERE id=?",(user["id"],)).fetchone()
+    return {"user":dict(row)}
+
+@app.patch("/api/auth/password")
+def update_password(payload:PasswordUpdateRequest,request:Request):
+    user=current_user(request)
+    if not verify_password(payload.current_password,user["password_hash"]): raise HTTPException(400,"Текущий пароль указан неверно")
+    with closing(get_db()) as db:
+        db.execute("UPDATE users SET password_hash=?,updated_at=? WHERE id=?",(hash_password(payload.new_password),now_iso(),user["id"]))
+        db.commit()
+    return {"ok":True}
 
 @app.post("/api/auth/logout")
 def logout(request:Request):

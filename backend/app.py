@@ -609,8 +609,8 @@ init_db()
 with closing(get_db()) as _startup_db:
     _startup_db.execute(
         "UPDATE ai_requests SET status='failed',error=?,completed_at=? "
-        "WHERE status='queued'",
-        ("Сервис был перезапущен до начала генерации",now_iso())
+        "WHERE status IN ('queued','processing')",
+        ("Сервис был перезапущен до завершения генерации",now_iso())
     )
     _startup_db.commit()
 

@@ -59,6 +59,7 @@ MAX_ARCHIVE_UNCOMPRESSED_SIZE = int(os.getenv("MAX_ARCHIVE_UNCOMPRESSED_SIZE", s
 MAX_DOCUMENT_PAGES = int(os.getenv("MAX_DOCUMENT_PAGES", "500"))
 MAX_SPREADSHEET_SHEETS = int(os.getenv("MAX_SPREADSHEET_SHEETS", "100"))
 MAX_PRESENTATION_SLIDES = int(os.getenv("MAX_PRESENTATION_SLIDES", "500"))
+AI_CONNECT_TIMEOUT = float(os.getenv("AI_CONNECT_TIMEOUT", "20"))
 AI_SEMAPHORE = threading.BoundedSemaphore(max(1, GLOBAL_AI_CONCURRENCY))
 AUTH_RATE_WINDOW = int(os.getenv("AUTH_RATE_WINDOW", "900"))
 AUTH_LOGIN_LIMIT = int(os.getenv("AUTH_LOGIN_LIMIT", "10"))
@@ -537,7 +538,7 @@ class ModelRouter:
         timeout=int(model["timeout"] or REQUEST_TIMEOUT)
         url=model["base_url"].rstrip("/")+"/chat/completions"
         req=urllib.request.Request(url,data=json.dumps(payload).encode("utf-8"),headers=headers,method="POST")
-        with urllib.request.urlopen(req,timeout=timeout) as response:
+        with urllib.request.urlopen(req,timeout=max(AI_CONNECT_TIMEOUT, timeout)) as response:
             data=json.loads(response.read().decode("utf-8"))
         content=data.get("choices",[{}])[0].get("message",{}).get("content")
         if not isinstance(content,str) or not content.strip():

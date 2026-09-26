@@ -1239,6 +1239,13 @@ def add_model_to_routing_set(routing_set_id:int,payload:RoutingSetModelRequest,r
             raise HTTPException(409,"Модель уже находится в этом наборе")
     return {"ok":True}
 
+@app.delete("/api/routing/sets/{routing_set_id}/models/{model_config_id}")
+def remove_model_from_routing_set(routing_set_id:int,model_config_id:int,request:Request):
+    require_admin(request)
+    with closing(get_db()) as db:
+        db.execute("DELETE FROM routing_set_models WHERE routing_set_id=? AND model_config_id=?",(routing_set_id,model_config_id));db.commit()
+    return {"ok":True}
+
 @app.put("/api/routing/tasks/{task_key}")
 def set_task_route(task_key:str,payload:TaskRouteRequest,request:Request):
     require_admin(request)

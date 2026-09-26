@@ -235,6 +235,10 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_files_user_created ON files(user_id,created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_ai_requests_user_created ON ai_requests(user_id,created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_ai_requests_chat_created ON ai_requests(chat_id,created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_routing_set_models_model ON routing_set_models(model_config_id);
+        CREATE INDEX IF NOT EXISTS idx_task_routes_routing_set ON task_routes(routing_set_id);
+        CREATE INDEX IF NOT EXISTS idx_message_files_file ON message_files(file_id);
+        CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_message_id);
         UPDATE ai_requests SET status='failed',error=COALESCE(error,'Дубликат активного запроса очищен при миграции'),completed_at=COALESCE(completed_at,CURRENT_TIMESTAMP) WHERE task_key='main_generation' AND status IN ('queued','processing') AND id NOT IN (SELECT MAX(id) FROM ai_requests WHERE task_key='main_generation' AND status IN ('queued','processing') GROUP BY chat_id);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_requests_one_active_main_chat ON ai_requests(chat_id) WHERE task_key='main_generation' AND status IN ('queued','processing');
         """)

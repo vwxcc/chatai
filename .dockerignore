@@ -1,0 +1,12 @@
+.git
+.github
+.gitignore
+.env
+data
+uploads
+__pycache__
+*.pyc
+*.pyo
+*.db
+*.sqlite
+*.sqlite3

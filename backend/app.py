@@ -1071,9 +1071,9 @@ def branch_message(message_id:int,request:Request):
     user=current_user(request)
     with closing(get_db()) as db:
         row=db.execute("SELECT m.*,c.user_id,c.title FROM messages m JOIN chats c ON c.id=m.chat_id WHERE m.id=?",(message_id,)).fetchone()
-        if row is not None:
-            ensure_no_active_main_request(db,int(row["chat_id"]))
-        if row is None or int(row["user_id"])!=int(user["id"]): raise HTTPException(404,"Сообщение не найдено")
+        if row is None or int(row["user_id"])!=int(user["id"]):
+            raise HTTPException(404,"Сообщение не найдено")
+        ensure_no_active_main_request(db,int(row["chat_id"]))
         ts=now_iso()
         title=(row["title"] or "Новый чат")+" — ветка"
         cur=db.execute("INSERT INTO chats(user_id,title,created_at,updated_at,archived) VALUES(?,?,?,?,0)",(user["id"],title,ts,ts))

@@ -599,6 +599,17 @@ app.add_middleware(SessionMiddleware,secret_key=SESSION_SECRET,session_cookie="c
 app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=False,allow_methods=["*"],allow_headers=["*"])
 init_db()
 
+# A queued request is never actively processed by another task: generation starts
+# synchronously in the same HTTP request. If the process restarts after creating
+# the record but before generation begins, do not leave that record stuck forever.
+with closing(get_db()) as _startup_db:
+    _startup_db.execute(
+        "UPDATE ai_requests SET status='failed',error=?,completed_at=? "
+        "WHERE status='queued'",
+        ("Сервис был перезапущен до начала генерации",now_iso())
+    )
+    _startup_db.commit()
+
 @app.get("/api/health")
 def health():
     return {"status":"ok"}

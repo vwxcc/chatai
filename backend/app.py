@@ -1418,6 +1418,9 @@ def delete_file(file_id:int,request:Request):
     with closing(get_db()) as db:
         row=db.execute("SELECT path FROM files WHERE id=? AND user_id=?",(file_id,user["id"])).fetchone()
         if row is None: raise HTTPException(404,"Файл не найден")
+        attached=db.execute("SELECT COUNT(*) AS count FROM message_files mf JOIN messages m ON m.id=mf.message_id JOIN chats c ON c.id=m.chat_id WHERE mf.file_id=? AND c.user_id=?",(file_id,user["id"])).fetchone()
+        if int(attached["count"])>0:
+            raise HTTPException(409,"Файл используется в истории чатов. Сначала удалите сообщения с этим вложением или оставьте файл в библиотеке.")
         db.execute("DELETE FROM files WHERE id=? AND user_id=?",(file_id,user["id"]))
         db.commit()
     Path(row["path"]).unlink(missing_ok=True)

@@ -200,6 +200,7 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_files_user_created ON files(user_id,created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_ai_requests_user_created ON ai_requests(user_id,created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_ai_requests_chat_created ON ai_requests(chat_id,created_at DESC);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_requests_one_active_main_chat ON ai_requests(chat_id) WHERE task_key='main_generation' AND status IN ('queued','processing');
         """)
         columns = {row["name"] for row in db.execute("PRAGMA table_info(ai_requests)").fetchall()}
         if "cancel_requested" not in columns:
@@ -504,8 +505,14 @@ def time_monotonic():
 def create_ai_request(user_id:int,chat_id:int,task_key:str,message_id=None):
     ts=now_iso()
     with closing(get_db()) as db:
-        cur=db.execute("INSERT INTO ai_requests(user_id,chat_id,message_id,task_key,status,created_at) VALUES(?,?,?,?,?,?)",(user_id,chat_id,message_id,task_key,"queued",ts))
-        db.commit()
+        try:
+            cur=db.execute("INSERT INTO ai_requests(user_id,chat_id,message_id,task_key,status,created_at) VALUES(?,?,?,?,?,?)",(user_id,chat_id,message_id,task_key,"queued",ts))
+            db.commit()
+        except sqlite3.IntegrityError as exc:
+            db.rollback()
+            if task_key == "main_generation":
+                raise HTTPException(409,"В этом чате уже выполняется запрос")
+            raise
         return int(cur.lastrowid)
 
 def is_ai_request_cancelled(request_id:int) -> bool:
@@ -857,6 +864,9 @@ def create_request(payload:MessageRequest,request:Request,background_tasks:Backg
             if len(files)!=len(payload.file_ids): raise HTTPException(404,"Один или несколько файлов не найдены")
             if sum(int(x["size"]) for x in files)>MAX_TOTAL_FILE_SIZE:
                 raise HTTPException(413,f"Общий размер файлов слишком большой. Максимум: {MAX_TOTAL_FILE_SIZE // 1024 // 1024} МБ")
+        # Reserve the generation slot before changing chat history.
+        # The partial UNIQUE index makes this atomic even if two requests arrive together.
+        request_id=create_ai_request(int(user["id"]),payload.chat_id,"main_generation",None)
         ts=now_iso()
         if payload.edit_message_id is not None:
             target=db.execute("SELECT id FROM messages WHERE id=? AND chat_id=? AND user_id=? AND role='user'",(payload.edit_message_id,payload.chat_id,user["id"])).fetchone()
@@ -877,8 +887,7 @@ def create_request(payload:MessageRequest,request:Request,background_tasks:Backg
             user_message_id=int(cur.lastrowid)
         db.execute("UPDATE chats SET updated_at=? WHERE id=? AND user_id=?",(ts,payload.chat_id,user["id"]))
         db.commit()
-    request_id=create_ai_request(int(user["id"]),payload.chat_id,"main_generation",user_message_id)
-    update_ai_request(request_id,status="processing",started_at=now_iso())
+    update_ai_request(request_id,message_id=user_message_id,status="processing",started_at=now_iso())
     with closing(get_db()) as db:
         ai_messages=_chat_ai_messages(db,payload.chat_id)
     try:
@@ -1085,6 +1094,9 @@ def stream_request(payload:MessageRequest,request:Request,background_tasks:Backg
             if len(files)!=len(payload.file_ids): raise HTTPException(404,"Один или несколько файлов не найдены")
             if sum(int(x["size"]) for x in files)>MAX_TOTAL_FILE_SIZE:
                 raise HTTPException(413,f"Общий размер файлов слишком большой. Максимум: {MAX_TOTAL_FILE_SIZE // 1024 // 1024} МБ")
+        # Reserve the generation slot before changing chat history.
+        # The partial UNIQUE index makes this atomic even if two requests arrive together.
+        request_id=create_ai_request(int(user["id"]),payload.chat_id,"main_generation",None)
         ts=now_iso()
         if payload.edit_message_id is not None:
             target=db.execute("SELECT id FROM messages WHERE id=? AND chat_id=? AND user_id=? AND role='user'",(payload.edit_message_id,payload.chat_id,user["id"])).fetchone()
@@ -1105,8 +1117,7 @@ def stream_request(payload:MessageRequest,request:Request,background_tasks:Backg
             user_message_id=int(cur.lastrowid)
         db.execute("UPDATE chats SET updated_at=? WHERE id=? AND user_id=?",(ts,payload.chat_id,user["id"]))
         db.commit()
-    request_id=create_ai_request(int(user["id"]),payload.chat_id,"main_generation",user_message_id)
-    update_ai_request(request_id,status="processing",started_at=now_iso())
+    update_ai_request(request_id,message_id=user_message_id,status="processing",started_at=now_iso())
     with closing(get_db()) as db:
         ai_messages=_chat_ai_messages(db,payload.chat_id)
 

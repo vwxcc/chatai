@@ -281,6 +281,26 @@ def _file_extension(filename: str) -> str:
 def _safe_stored_filename(filename: str) -> str:
     return secrets.token_hex(16) + _file_extension(filename)
 
+def _validate_file_signature(filename: str, data: bytes) -> None:
+    ext=_file_extension(filename)
+    if not data:
+        raise HTTPException(400,"Пустые файлы не поддерживаются")
+    signatures={
+        ".pdf": lambda d: d.startswith(b"%PDF-"),
+        ".zip": lambda d: d.startswith(b"PK\\x03\\x04") or d.startswith(b"PK\\x05\\x06") or d.startswith(b"PK\\x07\\x08"),
+        ".png": lambda d: d.startswith(b"\\x89PNG\\r\\n\\x1a\\n"),
+        ".jpg": lambda d: d.startswith(b"\\xff\\xd8\\xff"),
+        ".jpeg": lambda d: d.startswith(b"\\xff\\xd8\\xff"),
+        ".gif": lambda d: d.startswith(b"GIF87a") or d.startswith(b"GIF89a"),
+        ".webp": lambda d: len(d)>=12 and d[:4]==b"RIFF" and d[8:12]==b"WEBP",
+        ".docx": lambda d: d.startswith(b"PK"),
+        ".xlsx": lambda d: d.startswith(b"PK"),
+        ".pptx": lambda d: d.startswith(b"PK"),
+    }
+    checker=signatures.get(ext)
+    if checker and not checker(data[:16]):
+        raise HTTPException(400,"Содержимое файла не соответствует его расширению")
+
 def _validate_archive_payload(filename: str, data: bytes) -> None:
     ext=_file_extension(filename)
     if ext not in {".zip",".docx",".xlsx",".pptx"}:
@@ -1564,6 +1584,7 @@ async def upload_file(request:Request):
     if _file_extension(filename) not in ALLOWED_FILE_EXTENSIONS: raise HTTPException(400,"Этот тип файла не поддерживается")
     data=await upload.read()
     if len(data)>MAX_FILE_SIZE: raise HTTPException(413,f"Файл слишком большой. Максимум: {MAX_FILE_SIZE // 1024 // 1024} МБ")
+    _validate_file_signature(filename,data)
     _validate_archive_payload(filename,data)
     target=(UPLOAD_DIR/_safe_stored_filename(filename)).resolve()
     try:

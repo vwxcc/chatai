@@ -1203,6 +1203,8 @@ def delete_model(model_id:int,request:Request):
     with closing(get_db()) as db:
         if db.execute("SELECT 1 FROM model_configs WHERE id=?",(model_id,)).fetchone() is None:
             raise HTTPException(404,"Модель не найдена")
+        if db.execute("SELECT 1 FROM routing_set_models WHERE model_config_id=?",(model_id,)).fetchone():
+            raise HTTPException(409,"Нельзя удалить модель, пока она используется в routing set")
         db.execute("DELETE FROM model_configs WHERE id=?",(model_id,))
         db.commit()
     return {"ok":True}

@@ -625,16 +625,26 @@ def create_request(payload:MessageRequest,request:Request,background_tasks:Backg
         raise HTTPException(400,"Сообщение не может быть пустым")
     with closing(get_db()) as db:
         get_owned_chat(db,payload.chat_id,int(user["id"]))
-        history=db.execute("SELECT role,content FROM messages WHERE chat_id=? ORDER BY created_at ASC,id ASC",(payload.chat_id,)).fetchall()
+        if len(set(payload.file_ids)) != len(payload.file_ids):
+            raise HTTPException(400,"Файлы указаны повторно")
+        files=[]
+        if payload.file_ids:
+            placeholders=",".join("?" for _ in payload.file_ids)
+            files=db.execute(f"SELECT id,filename,mime_type,size,path FROM files WHERE user_id=? AND id IN ({placeholders})",(user["id"],*payload.file_ids)).fetchall()
+            if len(files)!=len(payload.file_ids): raise HTTPException(404,"Один или несколько файлов не найдены")
+            if sum(int(x["size"]) for x in files)>MAX_TOTAL_FILE_SIZE:
+                raise HTTPException(413,f"Общий размер файлов слишком большой. Максимум: {MAX_TOTAL_FILE_SIZE // 1024 // 1024} МБ")
         ts=now_iso()
         cur=db.execute("INSERT INTO messages(chat_id,user_id,role,content,parent_message_id,created_at) VALUES(?,?, 'user',?,?,?)",(payload.chat_id,user["id"],content,payload.parent_message_id,ts))
+        if files:
+            db.executemany("INSERT INTO message_files(message_id,file_id) VALUES(?,?)",[(int(cur.lastrowid),int(x["id"])) for x in files])
         db.execute("UPDATE chats SET updated_at=? WHERE id=? AND user_id=?",(ts,payload.chat_id,user["id"]))
         db.commit()
         user_message_id=int(cur.lastrowid)
     request_id=create_ai_request(int(user["id"]),payload.chat_id,"main_generation",user_message_id)
     update_ai_request(request_id,status="processing",started_at=now_iso())
-    ai_messages=[{"role":row["role"],"content":row["content"]} for row in history]
-    ai_messages.append({"role":"user","content":content})
+    with closing(get_db()) as db:
+        ai_messages=_chat_ai_messages(db,payload.chat_id)
     try:
         result=MODEL_ROUTER.generate("main_generation",ai_messages,cancel_check=lambda: is_ai_request_cancelled(request_id),request_id=request_id)
     except HTTPException as exc:
@@ -769,16 +779,26 @@ def stream_request(payload:MessageRequest,request:Request,background_tasks:Backg
         raise HTTPException(400,"Сообщение не может быть пустым")
     with closing(get_db()) as db:
         get_owned_chat(db,payload.chat_id,int(user["id"]))
-        history=db.execute("SELECT role,content FROM messages WHERE chat_id=? ORDER BY created_at ASC,id ASC",(payload.chat_id,)).fetchall()
+        if len(set(payload.file_ids)) != len(payload.file_ids):
+            raise HTTPException(400,"Файлы указаны повторно")
+        files=[]
+        if payload.file_ids:
+            placeholders=",".join("?" for _ in payload.file_ids)
+            files=db.execute(f"SELECT id,filename,mime_type,size,path FROM files WHERE user_id=? AND id IN ({placeholders})",(user["id"],*payload.file_ids)).fetchall()
+            if len(files)!=len(payload.file_ids): raise HTTPException(404,"Один или несколько файлов не найдены")
+            if sum(int(x["size"]) for x in files)>MAX_TOTAL_FILE_SIZE:
+                raise HTTPException(413,f"Общий размер файлов слишком большой. Максимум: {MAX_TOTAL_FILE_SIZE // 1024 // 1024} МБ")
         ts=now_iso()
         cur=db.execute("INSERT INTO messages(chat_id,user_id,role,content,parent_message_id,created_at) VALUES(?,?, 'user',?,?,?)",(payload.chat_id,user["id"],content,payload.parent_message_id,ts))
+        if files:
+            db.executemany("INSERT INTO message_files(message_id,file_id) VALUES(?,?)",[(int(cur.lastrowid),int(x["id"])) for x in files])
         db.execute("UPDATE chats SET updated_at=? WHERE id=? AND user_id=?",(ts,payload.chat_id,user["id"]))
         db.commit()
         user_message_id=int(cur.lastrowid)
     request_id=create_ai_request(int(user["id"]),payload.chat_id,"main_generation",user_message_id)
     update_ai_request(request_id,status="processing",started_at=now_iso())
-    ai_messages=[{"role":row["role"],"content":row["content"]} for row in history]
-    ai_messages.append({"role":"user","content":content})
+    with closing(get_db()) as db:
+        ai_messages=_chat_ai_messages(db,payload.chat_id)
 
     def event(payload_data):
         return "data: "+json.dumps(payload_data,ensure_ascii=False,separators=(",",":"))+"\\n\\n"

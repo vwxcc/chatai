@@ -565,7 +565,13 @@ def get_chat(chat_id:int,request:Request):
             "SELECT id,chat_id,user_id,role,content,model,provider,routing_set,parent_message_id,created_at FROM messages WHERE chat_id=? ORDER BY created_at ASC,id ASC",
             (chat_id,)
         ).fetchall()
-    return {"chat":dict(chat),"messages":[dict(x) for x in messages]}
+        result=[]
+        for message in messages:
+            item=dict(message)
+            files=db.execute("SELECT f.id,f.filename,f.mime_type,f.size,f.created_at FROM message_files mf JOIN files f ON f.id=mf.file_id WHERE mf.message_id=? AND f.user_id=? ORDER BY f.id",(message["id"],user["id"])).fetchall()
+            item["files"]=[dict(x) for x in files]
+            result.append(item)
+    return {"chat":dict(chat),"messages":result}
 
 @app.patch("/api/chats/{chat_id}")
 def rename_chat(chat_id:int,payload:RenameChatRequest,request:Request):

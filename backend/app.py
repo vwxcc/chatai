@@ -485,8 +485,8 @@ class ModelConfigRequest(BaseModel):
     name: str = Field(min_length=1,max_length=120)
     model_name: str = Field(min_length=1,max_length=200)
     temperature: float | None = Field(default=None,ge=0,max=2)
-    max_tokens: int | None = Field(default=None,ge=1)
-    timeout: int | None = Field(default=None,ge=1)
+    max_tokens: int | None = Field(default=None,ge=1,max=200000)
+    timeout: int | None = Field(default=None,ge=1,max=3600)
 
 class ProviderUpdateRequest(BaseModel):
     name: str | None = Field(default=None,min_length=1,max_length=120)

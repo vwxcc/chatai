@@ -1452,8 +1452,17 @@ def set_task_route(task_key:str,payload:TaskRouteRequest,request:Request):
     if task_key not in {"main_generation","title_generation","suggestions_generation"}:
         raise HTTPException(400,"Неизвестная AI-задача")
     with closing(get_db()) as db:
-        if payload.routing_set_id is not None and db.execute("SELECT id FROM routing_sets WHERE id=?",(payload.routing_set_id,)).fetchone() is None:
-            raise HTTPException(404,"Набор маршрутизации не найден")
+        if payload.routing_set_id is not None:
+            if db.execute("SELECT id FROM routing_sets WHERE id=?",(payload.routing_set_id,)).fetchone() is None:
+                raise HTTPException(404,"Набор маршрутизации не найден")
+            if db.execute(
+                "SELECT 1 FROM routing_set_models rsm "
+                "JOIN model_configs mc ON mc.id=rsm.model_config_id "
+                "JOIN providers p ON p.id=mc.provider_id "
+                "WHERE rsm.routing_set_id=? AND mc.enabled=1 AND p.enabled=1 LIMIT 1",
+                (payload.routing_set_id,)
+            ).fetchone() is None:
+                raise HTTPException(409,"Нельзя назначить пустой набор: в нём нет доступной модели")
         db.execute("INSERT INTO task_routes(task_key,routing_set_id,updated_at) VALUES(?,?,?) ON CONFLICT(task_key) DO UPDATE SET routing_set_id=excluded.routing_set_id,updated_at=excluded.updated_at",(task_key,payload.routing_set_id,now_iso()))
         db.commit()
     return {"ok":True,"task_key":task_key,"routing_set_id":payload.routing_set_id}

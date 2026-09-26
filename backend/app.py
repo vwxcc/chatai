@@ -1044,11 +1044,15 @@ def list_task_routes(request:Request):
     return {"tasks":[dict(x) for x in rows]}
 
 @app.get("/api/files")
-def list_files(request:Request):
+def list_files(request:Request,q:str=""):
     user=current_user(request)
+    query=q.strip()[:MAX_SEARCH_LENGTH]
     with closing(get_db()) as db:
-        rows=db.execute("SELECT id,filename,mime_type,size,created_at FROM files WHERE user_id=? ORDER BY created_at DESC",(user["id"],)).fetchall()
-    return {"files":[dict(x) for x in rows]}
+        if query:
+            rows=db.execute("SELECT id,filename,mime_type,size,created_at FROM files WHERE user_id=? AND filename LIKE ? ORDER BY created_at DESC",(user["id"],"%"+query+"%")).fetchall()
+        else:
+            rows=db.execute("SELECT id,filename,mime_type,size,created_at FROM files WHERE user_id=? ORDER BY created_at DESC",(user["id"],)).fetchall()
+    return {"files":[{**dict(x),"download_url":f"/api/files/{x['id']}/download"} for x in rows]}
 
 @app.get("/")
 def frontend_root():

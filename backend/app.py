@@ -928,6 +928,57 @@ def cancel_request(request_id:int,request:Request):
         "request":data
     }
 
+
+@app.post("/api/messages/{message_id}/edit")
+def edit_message(message_id:int,payload:MessageRequest,request:Request):
+    user=current_user(request)
+    with closing(get_db()) as db:
+        row=db.execute("SELECT m.*,c.user_id FROM messages m JOIN chats c ON c.id=m.chat_id WHERE m.id=? AND m.role='user'",(message_id,)).fetchone()
+        if row is None or int(row["user_id"])!=int(user["id"]): raise HTTPException(404,"Сообщение не найдено")
+        if not payload.content and not payload.file_ids: raise HTTPException(400,"Сообщение не может быть пустым")
+        db.execute("UPDATE messages SET content=?,parent_message_id=? WHERE id=?",(payload.content,message_id,message_id))
+        db.execute("DELETE FROM message_files WHERE message_id=?",(message_id,))
+        if payload.file_ids:
+            placeholders=",".join("?" for _ in payload.file_ids)
+            files=db.execute(f"SELECT id FROM files WHERE user_id=? AND id IN ({placeholders})",(user["id"],*payload.file_ids)).fetchall()
+            if len(files)!=len(set(payload.file_ids)): raise HTTPException(404,"Файл не найден")
+            db.executemany("INSERT INTO message_files(message_id,file_id) VALUES(?,?)",[(message_id,int(x["id"])) for x in files])
+        db.execute("UPDATE chats SET updated_at=? WHERE id=?",(now_iso(),row["chat_id"]))
+        db.commit()
+    return {"ok":True,"chat_id":row["chat_id"],"message_id":message_id}
+
+@app.post("/api/messages/{message_id}/branch")
+def branch_message(message_id:int,request:Request):
+    user=current_user(request)
+    with closing(get_db()) as db:
+        row=db.execute("SELECT m.*,c.user_id,c.title FROM messages m JOIN chats c ON c.id=m.chat_id WHERE m.id=?",(message_id,)).fetchone()
+        if row is None or int(row["user_id"])!=int(user["id"]): raise HTTPException(404,"Сообщение не найдено")
+        ts=now_iso()
+        title=(row["title"] or "Новый чат")+" — ветка"
+        cur=db.execute("INSERT INTO chats(user_id,title,created_at,updated_at,archived) VALUES(?,?,?,?,0)",(user["id"],title,ts,ts))
+        new_chat_id=int(cur.lastrowid)
+        rows=db.execute("SELECT * FROM messages WHERE chat_id=? AND id<=? ORDER BY created_at ASC,id ASC",(row["chat_id"],message_id)).fetchall()
+        idmap={}
+        for old in rows:
+            new_parent=idmap.get(old["parent_message_id"])
+            c=db.execute("INSERT INTO messages(chat_id,user_id,role,content,model,provider,routing_set,parent_message_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(new_chat_id,user["id"],old["role"],old["content"],old["model"],old["provider"],old["routing_set"],new_parent,old["created_at"]))
+            idmap[int(old["id"])]=int(c.lastrowid)
+            files=db.execute("SELECT file_id FROM message_files WHERE message_id=?",(old["id"],)).fetchall()
+            db.executemany("INSERT INTO message_files(message_id,file_id) VALUES(?,?)",[(int(c.lastrowid),int(x["file_id"])) for x in files])
+        db.commit()
+    return {"chat_id":new_chat_id}
+
+@app.post("/api/messages/{message_id}/retry")
+def retry_message(message_id:int,request:Request):
+    user=current_user(request)
+    with closing(get_db()) as db:
+        row=db.execute("SELECT m.*,c.user_id FROM messages m JOIN chats c ON c.id=m.chat_id WHERE m.id=? AND m.role='assistant'",(message_id,)).fetchone()
+        if row is None or int(row["user_id"])!=int(user["id"]): raise HTTPException(404,"Ответ не найден")
+        parent=db.execute("SELECT * FROM messages WHERE chat_id=? AND id<? ORDER BY id DESC LIMIT 1",(row["chat_id"],row["id"])).fetchone()
+        if parent is None or parent["role"]!="user": raise HTTPException(400,"Перед ответом не найден запрос пользователя")
+        payload={"chat_id":int(row["chat_id"]),"content":parent["content"],"parent_message_id":int(parent["id"]),"file_ids":[]}
+    return {"chat_id":payload["chat_id"],"content":payload["content"],"parent_message_id":payload["parent_message_id"]}
+
 @app.post("/api/requests/stream")
 def stream_request(payload:MessageRequest,request:Request,background_tasks:BackgroundTasks):
     user=current_user(request)

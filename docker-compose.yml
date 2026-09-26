@@ -1,0 +1,19 @@
+services:
+  chatstudio:
+    build: .
+    container_name: chatstudio
+    restart: unless-stopped
+    ports:
+      - "3050:8000"
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /app/data
+      UPLOAD_DIR: /app/uploads
+      FRONTEND_DIR: /app/frontend
+      SESSION_COOKIE_SECURE: "1"
+      CSRF_PROTECTION: "1"
+    volumes:
+      - ./data:/app/data
+      - ./uploads:/app/uploads
+    stop_grace_period: 30s

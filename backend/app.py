@@ -23,7 +23,7 @@ def require_admin(request:Request):
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -663,6 +663,16 @@ def _run_post_response_tasks(chat_id:int, user_id:int):
         logging.exception("Post-response AI tasks failed for chat_id=%s",chat_id)
 
 app = FastAPI(title="ChatStudio API",version="0.1.0")
+
+@app.middleware("http")
+async def same_origin_api_middleware(request: Request, call_next):
+    if CSRF_PROTECTION and request.method in {"POST","PUT","PATCH","DELETE"} and request.url.path.startswith("/api/"):
+        origin = request.headers.get("origin")
+        if origin:
+            expected = f"{request.url.scheme}://{request.headers.get('host', '')}"
+            if origin.rstrip("/") != expected.rstrip("/"):
+                return JSONResponse(status_code=403, content={"detail":"Недопустимый источник запроса"})
+    return await call_next(request)
 app.add_middleware(SessionMiddleware,secret_key=SESSION_SECRET,session_cookie="chatstudio_session",same_site="lax",https_only=SESSION_COOKIE_SECURE,max_age=60*60*24*30)
 app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=False,allow_methods=["*"],allow_headers=["*"])
 init_db()

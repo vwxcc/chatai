@@ -1247,6 +1247,16 @@ def list_files(request:Request,q:str=""):
             rows=db.execute("SELECT id,filename,mime_type,size,created_at FROM files WHERE user_id=? ORDER BY created_at DESC",(user["id"],)).fetchall()
     return {"files":[{**dict(x),"download_url":f"/api/files/{x['id']}/download"} for x in rows]}
 
+@app.get("/share/{token}")
+def shared_frontend(token:str):
+    with closing(get_db()) as db:
+        row=db.execute("SELECT id FROM chat_shares WHERE token=? AND enabled=1",(token,)).fetchone()
+    if row is None:
+        raise HTTPException(404,"Ссылка недействительна или отключена")
+    index=FRONTEND_DIR/"index.html"
+    if not index.exists(): raise HTTPException(404,"Frontend not found")
+    return FileResponse(index)
+
 @app.get("/")
 def frontend_root():
     index=FRONTEND_DIR/"index.html"

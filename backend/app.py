@@ -14,6 +14,12 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+def require_admin(request:Request):
+    user=current_user(request)
+    if not ADMIN_EMAILS or str(user["email"]).lower() not in ADMIN_EMAILS:
+        raise HTTPException(403,"Требуются права администратора")
+    return user
+
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,6 +40,7 @@ SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-only-change-me")
 MAX_NAME_LENGTH = int(os.getenv("MAX_NAME_LENGTH", "80"))
 MAX_PROMPT_LENGTH = int(os.getenv("MAX_PROMPT_LENGTH", "30000"))
 MAX_SEARCH_LENGTH = int(os.getenv("MAX_SEARCH_LENGTH", "200"))
+ADMIN_EMAILS = {x.strip().lower() for x in os.getenv("ADMIN_EMAILS","").split(",") if x.strip()}
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", str(20 * 1024 * 1024)))
 MAX_TOTAL_FILE_SIZE = int(os.getenv("MAX_TOTAL_FILE_SIZE", str(50 * 1024 * 1024)))
 MAX_FILES_PER_REQUEST = int(os.getenv("MAX_FILES_PER_REQUEST", "20"))
@@ -1110,14 +1117,14 @@ def list_chat_requests(chat_id:int,request:Request):
 
 @app.get("/api/routing/providers")
 def list_providers(request:Request):
-    current_user(request)
+    require_admin(request)
     with closing(get_db()) as db:
         rows=db.execute("SELECT id,name,base_url,api_key_env,enabled,created_at,updated_at FROM providers ORDER BY name COLLATE NOCASE").fetchall()
     return {"providers":[dict(x) for x in rows]}
 
 @app.post("/api/routing/providers")
 def create_provider(payload:ProviderRequest,request:Request):
-    current_user(request)
+    require_admin(request)
     ts=now_iso()
     with closing(get_db()) as db:
         try:
@@ -1130,7 +1137,7 @@ def create_provider(payload:ProviderRequest,request:Request):
 
 @app.patch("/api/routing/providers/{provider_id}")
 def update_provider(provider_id:int,payload:ProviderUpdateRequest,request:Request):
-    current_user(request)
+    require_admin(request)
     with closing(get_db()) as db:
         row=db.execute("SELECT id,name,base_url,api_key_env,enabled,created_at,updated_at FROM providers WHERE id=?",(provider_id,)).fetchone()
         if row is None: raise HTTPException(404,"Провайдер не найден")
@@ -1148,7 +1155,7 @@ def update_provider(provider_id:int,payload:ProviderUpdateRequest,request:Reques
 
 @app.delete("/api/routing/providers/{provider_id}")
 def delete_provider(provider_id:int,request:Request):
-    current_user(request)
+    require_admin(request)
     with closing(get_db()) as db:
         row=db.execute("SELECT id FROM providers WHERE id=?",(provider_id,)).fetchone()
         if row is None: raise HTTPException(404,"Провайдер не найден")
@@ -1160,14 +1167,14 @@ def delete_provider(provider_id:int,request:Request):
 
 @app.get("/api/routing/models")
 def list_models(request:Request):
-    current_user(request)
+    require_admin(request)
     with closing(get_db()) as db:
         rows=db.execute("SELECT mc.id,mc.name,mc.model_name,mc.temperature,mc.max_tokens,mc.timeout,mc.enabled,p.id AS provider_id,p.name AS provider_name FROM model_configs mc JOIN providers p ON p.id=mc.provider_id ORDER BY p.name COLLATE NOCASE,mc.name COLLATE NOCASE").fetchall()
     return {"models":[dict(x) for x in rows]}
 
 @app.patch("/api/routing/models/{model_id}")
 def update_model(model_id:int,payload:ModelConfigUpdateRequest,request:Request):
-    current_user(request)
+    require_admin(request)
     with closing(get_db()) as db:
         row=db.execute("SELECT id,provider_id,name,model_name,temperature,max_tokens,timeout,enabled,created_at,updated_at FROM model_configs WHERE id=?",(model_id,)).fetchone()
         if row is None: raise HTTPException(404,"Модель не найдена")
@@ -1187,7 +1194,7 @@ def update_model(model_id:int,payload:ModelConfigUpdateRequest,request:Request):
 
 @app.delete("/api/routing/models/{model_id}")
 def delete_model(model_id:int,request:Request):
-    current_user(request)
+    require_admin(request)
     with closing(get_db()) as db:
         if db.execute("SELECT 1 FROM model_configs WHERE id=?",(model_id,)).fetchone() is None:
             raise HTTPException(404,"Модель не найдена")
@@ -1197,7 +1204,7 @@ def delete_model(model_id:int,request:Request):
 
 @app.post("/api/routing/models")
 def create_model(payload:ModelConfigRequest,request:Request):
-    current_user(request)
+    require_admin(request)
     ts=now_iso()
     with closing(get_db()) as db:
         if db.execute("SELECT id FROM providers WHERE id=?",(payload.provider_id,)).fetchone() is None:
@@ -1212,7 +1219,7 @@ def create_model(payload:ModelConfigRequest,request:Request):
 
 @app.post("/api/routing/sets/{routing_set_id}/models")
 def add_model_to_routing_set(routing_set_id:int,payload:RoutingSetModelRequest,request:Request):
-    current_user(request)
+    require_admin(request)
     with closing(get_db()) as db:
         if db.execute("SELECT id FROM routing_sets WHERE id=?",(routing_set_id,)).fetchone() is None:
             raise HTTPException(404,"Набор маршрутизации не найден")
@@ -1229,7 +1236,7 @@ def add_model_to_routing_set(routing_set_id:int,payload:RoutingSetModelRequest,r
 
 @app.put("/api/routing/tasks/{task_key}")
 def set_task_route(task_key:str,payload:TaskRouteRequest,request:Request):
-    current_user(request)
+    require_admin(request)
     if task_key not in {"main_generation","title_generation","suggestions_generation"}:
         raise HTTPException(400,"Неизвестная AI-задача")
     with closing(get_db()) as db:
@@ -1241,7 +1248,7 @@ def set_task_route(task_key:str,payload:TaskRouteRequest,request:Request):
 
 @app.get("/api/routing/sets")
 def list_routing_sets(request:Request):
-    current_user(request)
+    require_admin(request)
     with closing(get_db()) as db:
         sets=db.execute("SELECT id,name,description,created_at,updated_at FROM routing_sets ORDER BY name COLLATE NOCASE").fetchall()
         result=[]
@@ -1255,7 +1262,7 @@ def list_routing_sets(request:Request):
 
 @app.post("/api/routing/sets")
 def create_routing_set(payload:RoutingSetRequest,request:Request):
-    current_user(request)
+    require_admin(request)
     name=payload.name.strip()
     with closing(get_db()) as db:
         try:
@@ -1269,7 +1276,7 @@ def create_routing_set(payload:RoutingSetRequest,request:Request):
 
 @app.get("/api/routing/tasks/{task_key}")
 def get_task_route(task_key:str,request:Request):
-    current_user(request)
+    require_admin(request)
     if task_key not in {"main_generation","title_generation","suggestions_generation"}:
         raise HTTPException(400,"Неизвестная AI-задача")
     with closing(get_db()) as db:
@@ -1278,7 +1285,7 @@ def get_task_route(task_key:str,request:Request):
 
 @app.get("/api/routing/tasks")
 def list_task_routes(request:Request):
-    current_user(request)
+    require_admin(request)
     with closing(get_db()) as db:
         rows=db.execute("SELECT tr.task_key,tr.routing_set_id,rs.name AS routing_set_name,tr.updated_at FROM task_routes tr LEFT JOIN routing_sets rs ON rs.id=tr.routing_set_id ORDER BY tr.task_key").fetchall()
     return {"tasks":[dict(x) for x in rows]}

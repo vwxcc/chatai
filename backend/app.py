@@ -37,6 +37,7 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = DATA_DIR / "chatstudio.db"
 SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-only-change-me")
+SESSION_COOKIE_SECURE = os.getenv("SESSION_COOKIE_SECURE", "0").strip().lower() in {"1","true","yes","on"}
 MAX_NAME_LENGTH = int(os.getenv("MAX_NAME_LENGTH", "80"))
 MAX_PROMPT_LENGTH = int(os.getenv("MAX_PROMPT_LENGTH", "30000"))
 MAX_SEARCH_LENGTH = int(os.getenv("MAX_SEARCH_LENGTH", "200"))
@@ -594,7 +595,7 @@ def _run_post_response_tasks(chat_id:int, user_id:int):
         logging.exception("Post-response AI tasks failed for chat_id=%s",chat_id)
 
 app = FastAPI(title="ChatStudio API",version="0.1.0")
-app.add_middleware(SessionMiddleware,secret_key=SESSION_SECRET,session_cookie="chatstudio_session",same_site="lax",https_only=False,max_age=60*60*24*30)
+app.add_middleware(SessionMiddleware,secret_key=SESSION_SECRET,session_cookie="chatstudio_session",same_site="lax",https_only=SESSION_COOKIE_SECURE,max_age=60*60*24*30)
 app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=False,allow_methods=["*"],allow_headers=["*"])
 init_db()
 
@@ -755,7 +756,7 @@ def get_shared_chat(token:str):
 def get_shared_file(token:str,file_id:int):
     chat,_,share=_shared_chat(token)
     with closing(get_db()) as db:
-        row=db.execute("SELECT f.path,f.filename,f.mime_type FROM files f JOIN message_files mf ON mf.file_id=f.id JOIN messages m ON m.id=mf.message_id WHERE f.id=? AND m.chat_id=?",(file_id,chat["id"])).fetchone()
+        row=db.execute("SELECT f.path,f.filename,f.mime_type FROM files f JOIN message_files mf ON mf.file_id=f.id JOIN messages m ON m.id=mf.message_id JOIN chats c ON c.id=m.chat_id WHERE f.id=? AND m.chat_id=? AND f.user_id=c.user_id",(file_id,chat["id"])).fetchone()
     if row is None or not Path(row["path"]).is_file(): raise HTTPException(404,"Файл не найден")
     return FileResponse(row["path"],media_type=row["mime_type"] or "application/octet-stream",filename=row["filename"])
 

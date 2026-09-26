@@ -149,6 +149,16 @@ def init_db() -> None:
             updated_at TEXT NOT NULL,
             FOREIGN KEY (routing_set_id) REFERENCES routing_sets(id) ON DELETE SET NULL
         );
+        CREATE TABLE IF NOT EXISTS chat_shares (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL UNIQUE,
+            token TEXT NOT NULL UNIQUE,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_chat_shares_token ON chat_shares(token);
         CREATE TABLE IF NOT EXISTS chat_suggestions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER NOT NULL,
@@ -297,6 +307,9 @@ class LoginRequest(BaseModel):
 
 class CreateChatRequest(BaseModel):
     title: str = Field(default="Новый чат",min_length=1,max_length=200)
+
+class ShareUpdateRequest(BaseModel):
+    enabled: bool = True
 
 class RenameChatRequest(BaseModel):
     title: str = Field(min_length=1,max_length=200)
@@ -642,6 +655,74 @@ def get_chat(chat_id:int,request:Request):
             item["files"]=[dict(x) for x in files]
             result.append(item)
     return {"chat":dict(chat),"messages":result}
+
+@app.post("/api/chats/{chat_id}/share")
+def create_chat_share(chat_id:int,request:Request):
+    user=current_user(request)
+    with closing(get_db()) as db:
+        get_owned_chat(db,chat_id,int(user["id"]))
+        row=db.execute("SELECT id,chat_id,token,enabled,created_at,updated_at FROM chat_shares WHERE chat_id=?",(chat_id,)).fetchone()
+        if row is None:
+            ts=now_iso()
+            token=secrets.token_urlsafe(32)
+            db.execute("INSERT INTO chat_shares(chat_id,token,enabled,created_at,updated_at) VALUES(?,?,?,?,?)",(chat_id,token,1,ts,ts))
+            db.commit()
+            row=db.execute("SELECT id,chat_id,token,enabled,created_at,updated_at FROM chat_shares WHERE chat_id=?",(chat_id,)).fetchone()
+        elif not row["enabled"]:
+            db.execute("UPDATE chat_shares SET enabled=1,updated_at=? WHERE chat_id=?",(now_iso(),chat_id))
+            db.commit()
+            row=db.execute("SELECT id,chat_id,token,enabled,created_at,updated_at FROM chat_shares WHERE chat_id=?",(chat_id,)).fetchone()
+    return {"share":{**dict(row),"url":f"/share/{row['token']}"}}
+
+@app.get("/api/chats/{chat_id}/share")
+def get_chat_share(chat_id:int,request:Request):
+    user=current_user(request)
+    with closing(get_db()) as db:
+        get_owned_chat(db,chat_id,int(user["id"]))
+        row=db.execute("SELECT id,chat_id,token,enabled,created_at,updated_at FROM chat_shares WHERE chat_id=?",(chat_id,)).fetchone()
+    if row is None:
+        return {"share":None}
+    return {"share":{**dict(row),"url":f"/share/{row['token']}"}}
+
+@app.patch("/api/chats/{chat_id}/share")
+def update_chat_share(chat_id:int,payload:ShareUpdateRequest,request:Request):
+    user=current_user(request)
+    with closing(get_db()) as db:
+        get_owned_chat(db,chat_id,int(user["id"]))
+        row=db.execute("SELECT id,chat_id,token,enabled,created_at,updated_at FROM chat_shares WHERE chat_id=?",(chat_id,)).fetchone()
+        if row is None: raise HTTPException(404,"Ссылка ещё не создана")
+        db.execute("UPDATE chat_shares SET enabled=?,updated_at=? WHERE chat_id=?",(int(payload.enabled),now_iso(),chat_id))
+        db.commit()
+        row=db.execute("SELECT id,chat_id,token,enabled,created_at,updated_at FROM chat_shares WHERE chat_id=?",(chat_id,)).fetchone()
+    return {"share":{**dict(row),"url":f"/share/{row['token']}"}}
+
+def _shared_chat(token:str):
+    with closing(get_db()) as db:
+        share=db.execute("SELECT id,chat_id,token,enabled FROM chat_shares WHERE token=?",(token,)).fetchone()
+        if share is None or not share["enabled"]: raise HTTPException(404,"Ссылка недействительна или отключена")
+        chat=db.execute("SELECT id,title,created_at,updated_at FROM chats WHERE id=?",(share["chat_id"],)).fetchone()
+        if chat is None: raise HTTPException(404,"Чат не найден")
+        messages=db.execute("SELECT id,role,content,model,provider,routing_set,parent_message_id,created_at FROM messages WHERE chat_id=? ORDER BY created_at ASC,id ASC",(share["chat_id"],)).fetchall()
+        result=[]
+        for message in messages:
+            item=dict(message)
+            files=db.execute("SELECT f.id,f.filename,f.mime_type,f.size FROM message_files mf JOIN files f ON f.id=mf.file_id JOIN chats c ON c.id=? WHERE mf.message_id=? AND f.user_id=c.user_id ORDER BY f.id",(share["chat_id"],message["id"])).fetchall()
+            item["files"]=[dict(x) for x in files]
+            result.append(item)
+    return dict(chat),result,share
+
+@app.get("/api/shared/{token}")
+def get_shared_chat(token:str):
+    chat,messages,share=_shared_chat(token)
+    return {"chat":chat,"messages":messages,"read_only":True}
+
+@app.get("/api/shared/{token}/files/{file_id}")
+def get_shared_file(token:str,file_id:int):
+    chat,_,share=_shared_chat(token)
+    with closing(get_db()) as db:
+        row=db.execute("SELECT f.path,f.filename,f.mime_type FROM files f JOIN message_files mf ON mf.file_id=f.id JOIN messages m ON m.id=mf.message_id WHERE f.id=? AND m.chat_id=?",(file_id,chat["id"])).fetchone()
+    if row is None or not Path(row["path"]).is_file(): raise HTTPException(404,"Файл не найден")
+    return FileResponse(row["path"],media_type=row["mime_type"] or "application/octet-stream",filename=row["filename"])
 
 @app.patch("/api/chats/{chat_id}")
 def rename_chat(chat_id:int,payload:RenameChatRequest,request:Request):

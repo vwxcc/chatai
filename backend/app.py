@@ -49,6 +49,29 @@ ALLOWED_FILE_EXTENSIONS = {".pdf",".docx",".txt",".md",".csv",".xls",".xlsx",".p
 GLOBAL_AI_CONCURRENCY = int(os.getenv("GLOBAL_AI_CONCURRENCY", "3"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "300"))
 AI_SEMAPHORE = threading.BoundedSemaphore(max(1, GLOBAL_AI_CONCURRENCY))
+AUTH_RATE_WINDOW = int(os.getenv("AUTH_RATE_WINDOW", "900"))
+AUTH_LOGIN_LIMIT = int(os.getenv("AUTH_LOGIN_LIMIT", "10"))
+AUTH_REGISTER_LIMIT = int(os.getenv("AUTH_REGISTER_LIMIT", "5"))
+_AUTH_RATE_LOCK = threading.Lock()
+_AUTH_RATE: dict[tuple[str,str], list[float]] = {}
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client and request.client.host else "unknown"
+
+def _check_auth_rate(request: Request, action: str, limit: int) -> None:
+    now = time.monotonic()
+    key = (_client_ip(request), action)
+    with _AUTH_RATE_LOCK:
+        attempts = [t for t in _AUTH_RATE.get(key, []) if now - t < AUTH_RATE_WINDOW]
+        if len(attempts) >= max(1, limit):
+            raise HTTPException(429, "Слишком много попыток. Попробуйте позже.")
+        attempts.append(now)
+        _AUTH_RATE[key] = attempts
+
+def _clear_auth_rate(request: Request, action: str) -> None:
+    key = (_client_ip(request), action)
+    with _AUTH_RATE_LOCK:
+        _AUTH_RATE.pop(key, None)
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -636,6 +659,7 @@ def health():
 
 @app.post("/api/auth/register")
 def register(payload:RegisterRequest,request:Request):
+    _check_auth_rate(request, "register", AUTH_REGISTER_LIMIT)
     name,email=payload.name.strip(),payload.email.strip().lower()
     if not name or "@" not in email:
         raise HTTPException(400,"Некорректные данные")
@@ -651,12 +675,14 @@ def register(payload:RegisterRequest,request:Request):
 
 @app.post("/api/auth/login")
 def login(payload:LoginRequest,request:Request):
+    _check_auth_rate(request, "login", AUTH_LOGIN_LIMIT)
     email=payload.email.strip().lower()
     with closing(get_db()) as db:
         user=db.execute("SELECT id,email,name,password_hash FROM users WHERE email=?",(email,)).fetchone()
     if user is None or not verify_password(payload.password,user["password_hash"]):
         raise HTTPException(401,"Неверный email или пароль")
     request.session["user_id"]=int(user["id"])
+    _clear_auth_rate(request, "login")
     return {"user":{"id":int(user["id"]),"email":user["email"],"name":user["name"]}}
 
 @app.patch("/api/auth/profile")

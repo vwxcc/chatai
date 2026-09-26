@@ -465,6 +465,8 @@ class ModelRouter:
                     return
                 except Exception as exc:
                     attempts.append({"provider":model["provider_name"],"model":model["model_name"],"status":"failed","error":str(exc)[:500],"duration_ms":int((time_monotonic()-started)*1000)})
+                    if request_id:
+                        update_ai_request(request_id,fallback_attempts_json=json.dumps(attempts,ensure_ascii=False))
                     if request_id and cancel_check and cancel_check():
                         raise RuntimeError("REQUEST_CANCELLED")
                     if model is not models[-1]:
@@ -490,6 +492,8 @@ class ModelRouter:
                     return {"content":content,"model":model["model_name"],"provider":model["provider_name"],"routing_set_id":routing_set_id,"fallback_attempts":attempts}
                 except Exception as exc:
                     attempts.append({"provider":model["provider_name"],"model":model["model_name"],"status":"failed","error":str(exc)[:500],"duration_ms":int((time_monotonic()-started)*1000)})
+                    if request_id:
+                        update_ai_request(request_id,fallback_attempts_json=json.dumps(attempts,ensure_ascii=False))
                     if request_id and cancel_check and cancel_check():
                         raise RuntimeError("REQUEST_CANCELLED")
         raise RuntimeError("ALL_MODELS_UNAVAILABLE")

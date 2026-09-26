@@ -15,7 +15,7 @@ from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -310,6 +310,67 @@ class ModelRouter:
         if not isinstance(content,str) or not content.strip():
             raise RuntimeError("Провайдер вернул пустой ответ")
         return content
+
+    def stream_generate(self, task_key: str, messages, cancel_check=None, request_id=None):
+        with closing(get_db()) as db:
+            models,routing_set_id=self._models_for_task(db,task_key)
+        if not models:
+            raise HTTPException(503,"В наборе маршрутизации нет доступных моделей")
+        attempts=[]
+        with AI_SEMAPHORE:
+            for model in models:
+                if cancel_check and cancel_check():
+                    raise RuntimeError("REQUEST_CANCELLED")
+                started=time_monotonic()
+                try:
+                    api_key=os.getenv(model["api_key_env"]) if model["api_key_env"] else None
+                    headers={"Content-Type":"application/json","Accept":"text/event-stream"}
+                    if api_key:
+                        headers["Authorization"]="Bearer "+api_key
+                    payload={"model":model["model_name"],"messages":messages,"stream":True}
+                    if model["temperature"] is not None:
+                        payload["temperature"]=model["temperature"]
+                    if model["max_tokens"] is not None:
+                        payload["max_tokens"]=model["max_tokens"]
+                    timeout=int(model["timeout"] or REQUEST_TIMEOUT)
+                    url=model["base_url"].rstrip("/")+"/chat/completions"
+                    req=urllib.request.Request(url,data=json.dumps(payload).encode("utf-8"),headers=headers,method="POST")
+                    response=urllib.request.urlopen(req,timeout=timeout)
+                    try:
+                        saw_content=False
+                        for raw_line in response:
+                            if cancel_check and cancel_check():
+                                raise RuntimeError("REQUEST_CANCELLED")
+                            line=raw_line.decode("utf-8",errors="replace").strip()
+                            if not line or not line.startswith("data:"):
+                                continue
+                            data_text=line[5:].strip()
+                            if data_text == "[DONE]":
+                                break
+                            try:
+                                data=json.loads(data_text)
+                            except json.JSONDecodeError:
+                                continue
+                            delta=data.get("choices",[{}])[0].get("delta",{}).get("content")
+                            if isinstance(delta,str) and delta:
+                                saw_content=True
+                                yield {"type":"delta","content":delta}
+                        if cancel_check and cancel_check():
+                            raise RuntimeError("REQUEST_CANCELLED")
+                        if not saw_content:
+                            raise RuntimeError("Провайдер вернул пустой поток")
+                    finally:
+                        response.close()
+                    attempts.append({"provider":model["provider_name"],"model":model["model_name"],"status":"success","duration_ms":int((time_monotonic()-started)*1000)})
+                    yield {"type":"done","model":model["model_name"],"provider":model["provider_name"],"routing_set_id":routing_set_id,"fallback_attempts":attempts}
+                    return
+                except Exception as exc:
+                    attempts.append({"provider":model["provider_name"],"model":model["model_name"],"status":"failed","error":str(exc)[:500],"duration_ms":int((time_monotonic()-started)*1000)})
+                    if request_id and cancel_check and cancel_check():
+                        raise RuntimeError("REQUEST_CANCELLED")
+                    if model is not models[-1]:
+                        yield {"type":"fallback","provider":model["provider_name"],"model":model["model_name"],"error":str(exc)[:200]}
+        raise RuntimeError("ALL_MODELS_UNAVAILABLE")
 
     def generate(self, task_key: str, messages, cancel_check=None, request_id=None):
         with closing(get_db()) as db:
@@ -699,6 +760,65 @@ def cancel_request(request_id:int,request:Request):
         "cancel_requested":bool(data["cancel_requested"]),
         "request":data
     }
+
+@app.post("/api/requests/stream")
+def stream_request(payload:MessageRequest,request:Request,background_tasks:BackgroundTasks):
+    user=current_user(request)
+    content=payload.content.strip()
+    if not content:
+        raise HTTPException(400,"Сообщение не может быть пустым")
+    with closing(get_db()) as db:
+        get_owned_chat(db,payload.chat_id,int(user["id"]))
+        history=db.execute("SELECT role,content FROM messages WHERE chat_id=? ORDER BY created_at ASC,id ASC",(payload.chat_id,)).fetchall()
+        ts=now_iso()
+        cur=db.execute("INSERT INTO messages(chat_id,user_id,role,content,parent_message_id,created_at) VALUES(?,?, 'user',?,?,?)",(payload.chat_id,user["id"],content,payload.parent_message_id,ts))
+        db.execute("UPDATE chats SET updated_at=? WHERE id=? AND user_id=?",(ts,payload.chat_id,user["id"]))
+        db.commit()
+        user_message_id=int(cur.lastrowid)
+    request_id=create_ai_request(int(user["id"]),payload.chat_id,"main_generation",user_message_id)
+    update_ai_request(request_id,status="processing",started_at=now_iso())
+    ai_messages=[{"role":row["role"],"content":row["content"]} for row in history]
+    ai_messages.append({"role":"user","content":content})
+
+    def event(payload_data):
+        return "data: "+json.dumps(payload_data,ensure_ascii=False,separators=(",",":"))+"\\n\\n"
+
+    def generate_events():
+        full_content=[]
+        selected=None
+        try:
+            yield event({"type":"start","request_id":request_id})
+            for item in MODEL_ROUTER.stream_generate("main_generation",ai_messages,cancel_check=lambda: is_ai_request_cancelled(request_id),request_id=request_id):
+                item_type=item.get("type")
+                if item_type=="delta":
+                    full_content.append(item["content"])
+                    yield event(item)
+                elif item_type=="fallback":
+                    yield event(item)
+                elif item_type=="done":
+                    selected=item
+            final_content="".join(full_content)
+            if not selected or not final_content.strip():
+                raise RuntimeError("Провайдер вернул пустой ответ")
+            with closing(get_db()) as db:
+                ts=now_iso()
+                cur=db.execute("INSERT INTO messages(chat_id,user_id,role,content,model,provider,routing_set,parent_message_id,created_at) VALUES(?,?, 'assistant',?,?,?,?,?,?,?)",(payload.chat_id,user["id"],final_content,selected["model"],selected["provider"],str(selected["routing_set_id"]),user_message_id,ts))
+                db.execute("UPDATE chats SET updated_at=? WHERE id=? AND user_id=?",(ts,payload.chat_id,user["id"]))
+                db.commit()
+                assistant=db.execute("SELECT id,chat_id,user_id,role,content,model,provider,routing_set,parent_message_id,created_at FROM messages WHERE id=?",(cur.lastrowid,)).fetchone()
+                user_message=db.execute("SELECT id,chat_id,user_id,role,content,model,provider,routing_set,parent_message_id,created_at FROM messages WHERE id=?",(user_message_id,)).fetchone()
+            update_ai_request(request_id,status="completed",message_id=int(assistant["id"]),provider=selected["provider"],model=selected["model"],routing_set=str(selected["routing_set_id"]),fallback_attempts_json=json.dumps(selected.get("fallback_attempts",[]),ensure_ascii=False),completed_at=now_iso())
+            background_tasks.add_task(_run_post_response_tasks,payload.chat_id,int(user["id"]))
+            yield event({"type":"complete","request_id":request_id,"message":dict(assistant),"user_message":dict(user_message)})
+        except RuntimeError as exc:
+            status="cancelled" if str(exc)=="REQUEST_CANCELLED" else "failed"
+            update_ai_request(request_id,status=status,error=str(exc),completed_at=now_iso())
+            yield event({"type":"cancelled" if status=="cancelled" else "error","request_id":request_id,"error":str(exc)})
+        except Exception as exc:
+            update_ai_request(request_id,status="failed",error=str(exc)[:500],completed_at=now_iso())
+            yield event({"type":"error","request_id":request_id,"error":"Запрос не выполнен"})
+
+    return StreamingResponse(generate_events(),media_type="text/event-stream",headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
 @app.get("/api/requests/{request_id}")
 def get_request_status(request_id:int,request:Request):

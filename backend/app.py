@@ -36,8 +36,11 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = DATA_DIR / "chatstudio.db"
-SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-only-change-me")
+SESSION_SECRET = os.getenv("SESSION_SECRET", "").strip()
+if len(SESSION_SECRET) < 32:
+    raise RuntimeError("SESSION_SECRET must be set to a random value of at least 32 characters")
 SESSION_COOKIE_SECURE = os.getenv("SESSION_COOKIE_SECURE", "0").strip().lower() in {"1","true","yes","on"}
+CSRF_PROTECTION = os.getenv("CSRF_PROTECTION", "1").strip().lower() in {"1","true","yes","on"}
 MAX_NAME_LENGTH = int(os.getenv("MAX_NAME_LENGTH", "80"))
 MAX_PROMPT_LENGTH = int(os.getenv("MAX_PROMPT_LENGTH", "30000"))
 MAX_SEARCH_LENGTH = int(os.getenv("MAX_SEARCH_LENGTH", "200"))
@@ -245,6 +248,16 @@ def verify_password(password: str, stored: str) -> bool:
         return hmac.compare_digest(derived.hex(),digest_hex)
     except (ValueError,TypeError):
         return False
+
+def _check_same_origin(request: Request) -> None:
+    if not CSRF_PROTECTION:
+        return
+    origin = request.headers.get("origin")
+    if not origin:
+        return
+    expected = f"{request.url.scheme}://{request.headers.get('host', '')}"
+    if origin.rstrip("/") != expected.rstrip("/"):
+        raise HTTPException(403, "Недопустимый источник запроса")
 
 def current_user(request: Request) -> sqlite3.Row:
     user_id = request.session.get("user_id")
@@ -659,6 +672,7 @@ def health():
 
 @app.post("/api/auth/register")
 def register(payload:RegisterRequest,request:Request):
+    _check_same_origin(request)
     _check_auth_rate(request, "register", AUTH_REGISTER_LIMIT)
     name,email=payload.name.strip(),payload.email.strip().lower()
     if not name or "@" not in email:
@@ -675,6 +689,7 @@ def register(payload:RegisterRequest,request:Request):
 
 @app.post("/api/auth/login")
 def login(payload:LoginRequest,request:Request):
+    _check_same_origin(request)
     _check_auth_rate(request, "login", AUTH_LOGIN_LIMIT)
     email=payload.email.strip().lower()
     with closing(get_db()) as db:
@@ -687,6 +702,7 @@ def login(payload:LoginRequest,request:Request):
 
 @app.patch("/api/auth/profile")
 def update_profile(payload:ProfileUpdateRequest,request:Request):
+    _check_same_origin(request)
     user=current_user(request)
     name=payload.name.strip()
     if not name: raise HTTPException(400,"Имя не может быть пустым")
@@ -707,6 +723,7 @@ def update_password(payload:PasswordUpdateRequest,request:Request):
 
 @app.post("/api/auth/logout")
 def logout(request:Request):
+    _check_same_origin(request)
     request.session.clear()
     return {"ok":True}
 

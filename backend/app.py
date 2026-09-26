@@ -56,6 +56,9 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "300"))
 MAX_FILE_CONTEXT_CHARS = int(os.getenv("MAX_FILE_CONTEXT_CHARS", "500000"))
 MAX_ARCHIVE_ENTRIES = int(os.getenv("MAX_ARCHIVE_ENTRIES", "2000"))
 MAX_ARCHIVE_UNCOMPRESSED_SIZE = int(os.getenv("MAX_ARCHIVE_UNCOMPRESSED_SIZE", str(100 * 1024 * 1024)))
+MAX_DOCUMENT_PAGES = int(os.getenv("MAX_DOCUMENT_PAGES", "500"))
+MAX_SPREADSHEET_SHEETS = int(os.getenv("MAX_SPREADSHEET_SHEETS", "100"))
+MAX_PRESENTATION_SLIDES = int(os.getenv("MAX_PRESENTATION_SLIDES", "500"))
 AI_SEMAPHORE = threading.BoundedSemaphore(max(1, GLOBAL_AI_CONCURRENCY))
 AUTH_RATE_WINDOW = int(os.getenv("AUTH_RATE_WINDOW", "900"))
 AUTH_LOGIN_LIMIT = int(os.getenv("AUTH_LOGIN_LIMIT", "10"))
@@ -349,26 +352,44 @@ def _read_file_for_ai(row: sqlite3.Row):
             return {"type":"text","text":f"Файл {row['filename']}:\n{text[:200000]}"}
         if ext==".pdf":
             from pypdf import PdfReader
-            text="\n".join((page.extract_text() or "") for page in PdfReader(str(path)).pages)
+            reader=PdfReader(str(path))
+            if len(reader.pages)>MAX_DOCUMENT_PAGES:
+                return {"type":"text","text":f"Файл {row['filename']}: слишком много страниц для автоматического извлечения (лимит {MAX_DOCUMENT_PAGES})."}
+            text="\n".join((page.extract_text() or "") for page in reader.pages)
             return {"type":"text","text":f"Файл {row['filename']} (извлечённый текст):\n{text[:200000]}"}
         if ext==".docx":
             from docx import Document
-            text="\n".join(p.text for p in Document(str(path)).paragraphs)
+            document=Document(str(path))
+            if len(document.paragraphs)>100000:
+                return {"type":"text","text":f"Файл {row['filename']}: слишком большой документ для автоматического извлечения."}
+            text="\n".join(p.text for p in document.paragraphs)
             return {"type":"text","text":f"Файл {row['filename']} (извлечённый текст):\n{text[:200000]}"}
         if ext in {".xls",".xlsx"}:
             from openpyxl import load_workbook
             wb=load_workbook(str(path),read_only=True,data_only=True)
+            if len(wb.worksheets)>MAX_SPREADSHEET_SHEETS:
+                return {"type":"text","text":f"Файл {row['filename']}: слишком много листов для автоматического извлечения (лимит {MAX_SPREADSHEET_SHEETS})."}
             chunks=[]
+            total_chars=0
             for ws in wb.worksheets:
                 chunks.append(f"[Лист: {ws.title}]")
                 for values in ws.iter_rows(values_only=True):
-                    chunks.append(" | ".join("" if v is None else str(v) for v in values))
-                    if len("\n".join(chunks))>200000: break
+                    line=" | ".join("" if v is None else str(v) for v in values)
+                    remaining=200000-total_chars
+                    if remaining<=0: break
+                    line=line[:remaining]
+                    chunks.append(line)
+                    total_chars+=len(line)+1
+                    if total_chars>=200000: break
+                if total_chars>=200000: break
             return {"type":"text","text":f"Файл {row['filename']}:\n" + "\n".join(chunks)[:200000]}
         if ext in {".ppt",".pptx"}:
             from pptx import Presentation
+            presentation=Presentation(str(path))
+            if len(presentation.slides)>MAX_PRESENTATION_SLIDES:
+                return {"type":"text","text":f"Файл {row['filename']}: слишком много слайдов для автоматического извлечения (лимит {MAX_PRESENTATION_SLIDES})."}
             chunks=[]
-            for slide in Presentation(str(path)).slides:
+            for slide in presentation.slides:
                 for shape in slide.shapes:
                     if hasattr(shape,"text") and shape.text: chunks.append(shape.text)
             return {"type":"text","text":f"Файл {row['filename']} (извлечённый текст):\n" + "\n".join(chunks)[:200000]}

@@ -672,11 +672,12 @@ def update_ai_request(request_id:int,**values):
         db.execute("UPDATE ai_requests SET "+",".join(parts)+" WHERE id=?",params)
         db.commit()
 
-def mark_ai_request_processing(request_id:int):
+def mark_ai_request_processing(request_id:int,message_id:int|None=None):
     with closing(get_db()) as db:
         cur=db.execute(
-            "UPDATE ai_requests SET status='processing',started_at=? WHERE id=? AND status='queued' AND cancel_requested=0",
-            (now_iso(),request_id)
+            "UPDATE ai_requests SET status='processing',message_id=COALESCE(?,message_id),started_at=? "
+            "WHERE id=? AND status='queued' AND cancel_requested=0",
+            (message_id,now_iso(),request_id)
         )
         db.commit()
         if cur.rowcount != 1:
@@ -1324,7 +1325,10 @@ def stream_request(payload:MessageRequest,request:Request,background_tasks:Backg
             db.rollback()
             update_ai_request(request_id,status="failed",error="Не удалось сохранить сообщение",completed_at=now_iso())
             raise
-    update_ai_request(request_id,message_id=user_message_id,status="processing",started_at=now_iso())
+    try:
+        mark_ai_request_processing(request_id,user_message_id)
+    except RuntimeError:
+        raise HTTPException(409,"Запрос уже остановлен")
     with closing(get_db()) as db:
         ai_messages=_chat_ai_messages(db,payload.chat_id)
 

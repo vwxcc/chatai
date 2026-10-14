@@ -50,7 +50,7 @@ TTS_KEY = os.getenv("TTS_API_KEY", "").strip() or AI_KEY
 TTS_BASE = os.getenv("TTS_API_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
 TTS_MODEL = os.getenv("TTS_MODEL", "fish-audio/s2.1-pro-free:free").strip()
 TTS_MODELS = [x.strip() for x in os.getenv("TTS_FALLBACK_MODELS", "").split(",") if x.strip()]
-DEFAULT_VOICE = os.getenv("TTS_DEFAULT_VOICE", "default").strip()
+DEFAULT_VOICE = os.getenv("TTS_DEFAULT_VOICE", "").strip()
 DEFAULT_SPEED = float(os.getenv("TTS_DEFAULT_SPEED", "1.0"))
 TTS_CHUNK = max(600, min(int(os.getenv("TTS_CHUNK_CHARS", "2600")), 4500))
 TTS_MAX = int(os.getenv("TTS_MAX_CHARS", "24000"))
@@ -375,8 +375,11 @@ async def request_tts(text: str, voice: str, speed: float):
                 response = await client.post(
                     endpoint,
                     headers={"Authorization": f"Bearer {TTS_KEY}", "Content-Type": "application/json"},
-                    json={"model": model, "input": text, "voice": voice,
-                          "response_format": "mp3", "speed": speed},
+                    json={
+                        **{"model": model, "input": text, "response_format": "mp3"},
+                        **({"voice": voice} if voice and not model.startswith("fish-audio/") else {}),
+                        **({"speed": speed} if model.startswith(("openai/", "azure/")) else {}),
+                    },
                 )
                 if response.status_code >= 400:
                     try:

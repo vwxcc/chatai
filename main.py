@@ -497,35 +497,99 @@ def split_speech(text: str, limit: int) -> list[str]:
 
 async def request_tts(text: str, voice: str, speed: float):
     if not TTS_KEY:
-        raise RuntimeError("Не задан TTS_API_KEY или общий AI_API_KEY.")
-    endpoint = TTS_BASE if TTS_BASE.endswith("/audio/speech") else f"{TTS_BASE}/audio/speech"
+        raise RuntimeError("Не задан TTS_API_KEY (или AI_API_KEY для общего ключа).")
+    if not TTS_BASE:
+        raise RuntimeError("Не задан TTS_API_BASE_URL.")
+    endpoint = _endpoint(TTS_BASE, TTS_PATH)
+    headers = _api_headers(TTS_KEY, TTS_AUTH_HEADER, TTS_AUTH_PREFIX, TTS_EXTRA_HEADERS)
     last_error = "неизвестная ошибка TTS"
-    async with httpx.AsyncClient(timeout=TTS_TIMEOUT) as client:
+
+    async with httpx.AsyncClient(timeout=TTS_TIMEOUT, follow_redirects=True) as client:
         for model in [TTS_MODEL, *TTS_MODELS]:
+            variables = {
+                "model": model,
+                "input": text,
+                "text": text,
+                "voice": voice,
+                "speed": speed,
+                "response_format": TTS_AUDIO_FORMAT,
+                "output_format": TTS_AUDIO_FORMAT,
+            }
             try:
-                response = await client.post(
-                    endpoint,
-                    headers={"Authorization": f"Bearer {TTS_KEY}", "Content-Type": "application/json"},
-                    json={
-                        **{"model": model, "input": text, "response_format": "mp3"},
-                        **({"voice": voice} if voice and not model.startswith("fish-audio/") else {}),
-                        **({"speed": speed} if model.startswith(("openai/", "azure/")) else {}),
-                    },
-                )
+                if TTS_MODE == "custom_json":
+                    body = _build_template(TTS_REQUEST_TEMPLATE, variables)
+                elif TTS_MODE == "openai_speech":
+                    body: dict[str, Any] = {"model": model, "input": text}
+                    if TTS_VOICE_FIELD and voice:
+                        body[TTS_VOICE_FIELD] = voice
+                    if TTS_SPEED_FIELD:
+                        body[TTS_SPEED_FIELD] = speed
+                    if TTS_FORMAT_FIELD:
+                        body[TTS_FORMAT_FIELD] = TTS_AUDIO_FORMAT
+                else:
+                    raise RuntimeError(
+                        f"Неизвестный TTS_API_MODE='{TTS_MODE}'. Используй openai_speech или custom_json."
+                    )
+
+                response = await client.post(endpoint, headers=headers, json=body)
                 if response.status_code >= 400:
                     try:
-                        details = response.json()
+                        detail = response.json()
                     except Exception:
-                        details = response.text[:400]
-                    raise RuntimeError(f"HTTP {response.status_code}: {str(details)[:400]}")
-                content_type = response.headers.get("content-type", "").lower()
-                if "json" in content_type or len(response.content) < 100:
-                    raise RuntimeError(f"API вернуло не аудио (Content-Type: {content_type})")
-                return response.content, model
+                        detail = response.text[:700]
+                    raise RuntimeError(f"HTTP {response.status_code}: {str(detail)[:700]}")
+
+                response_type = response.headers.get("content-type", "").lower()
+                if TTS_RESPONSE_MODE == "raw_audio":
+                    if "json" in response_type:
+                        try:
+                            detail = response.json()
+                        except Exception:
+                            detail = response.text[:500]
+                        raise RuntimeError(
+                            "API вернул JSON вместо бинарного аудио. "
+                            f"Проверь TTS_RESPONSE_MODE. Ответ: {str(detail)[:500]}"
+                        )
+                    if len(response.content) < 100:
+                        raise RuntimeError("API вернул слишком короткий аудиофайл.")
+                    return response.content, model
+
+                if TTS_RESPONSE_MODE == "json_base64":
+                    payload = response.json()
+                    encoded = _response_path(payload, TTS_RESPONSE_AUDIO_PATH)
+                    if not isinstance(encoded, str):
+                        raise RuntimeError("Поле с base64-аудио должно быть строкой.")
+                    if encoded.startswith("data:") and "," in encoded:
+                        encoded = encoded.split(",", 1)[1]
+                    try:
+                        audio = base64.b64decode(encoded, validate=True)
+                    except Exception as exc:
+                        raise RuntimeError(f"Не удалось декодировать base64-аудио: {exc}") from exc
+                    if len(audio) < 100:
+                        raise RuntimeError("API вернуло пустой или слишком короткий аудиофайл.")
+                    return audio, model
+
+                if TTS_RESPONSE_MODE == "json_url":
+                    payload = response.json()
+                    audio_url = _response_path(payload, TTS_RESPONSE_URL_PATH)
+                    if not isinstance(audio_url, str) or not audio_url.startswith(("https://", "http://")):
+                        raise RuntimeError("JSON-поле с аудио должно содержать абсолютный HTTP(S) URL.")
+                    # Never forward the TTS API key to a possibly different download host.
+                    file_response = await client.get(audio_url)
+                    file_response.raise_for_status()
+                    audio_type = file_response.headers.get("content-type", "").lower()
+                    if "json" in audio_type or len(file_response.content) < 100:
+                        raise RuntimeError("Ссылка не вернула бинарный аудиофайл.")
+                    return file_response.content, model
+
+                raise RuntimeError(
+                    f"Неизвестный TTS_RESPONSE_MODE='{TTS_RESPONSE_MODE}'. "
+                    "Допустимо raw_audio, json_base64 или json_url."
+                )
             except Exception as exc:
-                last_error = f"{model}: {exc}"
-                log.warning("TTS model failed: %s", last_error)
-    raise RuntimeError(f"Не удалось создать аудио: {last_error[:700]}")
+                last_error = f"{model or '(model omitted)'}: {exc}"
+                log.warning("TTS request failed (%s): %s", model, exc)
+    raise RuntimeError(f"Не удалось создать аудио. Последняя ошибка: {last_error[:700]}")
 
 
 async def ffmpeg(*args: str):

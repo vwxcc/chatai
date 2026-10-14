@@ -55,7 +55,7 @@ AI_API_PATH=/chat/completions
 AI_API_MODE=openai_chat
 AI_MODEL=имя-модели-из-документации-провайдера
 AI_AUTH_HEADER=Authorization
-AI_AUTH_PREFIX=Bearer 
+AI_AUTH_PREFIX=Bearer
 AI_EXTRA_HEADERS_JSON={}
 AI_RESPONSE_TEXT_PATH=choices.0.message.content
 \`\`\`

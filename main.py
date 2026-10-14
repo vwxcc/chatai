@@ -48,9 +48,9 @@ HISTORY_LIMIT = int(os.getenv("HISTORY_MESSAGES", "16"))
 
 TTS_KEY = os.getenv("TTS_API_KEY", "").strip() or AI_KEY
 TTS_BASE = os.getenv("TTS_API_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
-TTS_MODEL = os.getenv("TTS_MODEL", "openai/gpt-4o-mini-tts-2025-12-15").strip()
+TTS_MODEL = os.getenv("TTS_MODEL", "fish-audio/s2.1-pro-free:free").strip()
 TTS_MODELS = [x.strip() for x in os.getenv("TTS_FALLBACK_MODELS", "").split(",") if x.strip()]
-DEFAULT_VOICE = os.getenv("TTS_DEFAULT_VOICE", "alloy").strip()
+DEFAULT_VOICE = os.getenv("TTS_DEFAULT_VOICE", "default").strip()
 DEFAULT_SPEED = float(os.getenv("TTS_DEFAULT_SPEED", "1.0"))
 TTS_CHUNK = max(600, min(int(os.getenv("TTS_CHUNK_CHARS", "2600")), 4500))
 TTS_MAX = int(os.getenv("TTS_MAX_CHARS", "24000"))
@@ -71,6 +71,7 @@ if not HOOK_SECRET and BOT_TOKEN:
 dp = Dispatcher()
 bot: Bot | None = None
 polling_task: asyncio.Task | None = None
+webhook_tasks: set[asyncio.Task] = set()
 ai_lock = asyncio.Semaphore(max(1, int(os.getenv("AI_CONCURRENCY", "2"))))
 
 SYSTEM_PROMPT = r"""
@@ -729,7 +730,19 @@ async def telegram_webhook(request: Request):
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
     try:
         update = Update.model_validate(await request.json(), context={"bot": bot})
-        await dp.feed_update(bot, update)
+        # ACK Telegram immediately; AI/TTS can take longer than Telegram's webhook timeout.
+        task = asyncio.create_task(dp.feed_update(bot, update))
+        webhook_tasks.add(task)
+        def finished(completed: asyncio.Task):
+            webhook_tasks.discard(completed)
+            try:
+                completed.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                log.error("Background update failed: %s", exc,
+                          exc_info=(type(exc), exc, exc.__traceback__))
+        task.add_done_callback(finished)
     except Exception:
         log.exception("Telegram webhook update failed")
         raise HTTPException(status_code=500, detail="Update processing failed")

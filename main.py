@@ -312,11 +312,90 @@ def parse_ai_result(raw: str) -> tuple[str, str]:
     return html.escape(text) or "Не удалось получить ответ.", text or "Не удалось получить ответ."
 
 
+def _endpoint(base: str, path: str) -> str:
+    path = (path or "").strip()
+    if path.startswith(("http://", "https://")):
+        return path
+    if not base:
+        raise RuntimeError("Не задан API Base URL.")
+    if not path:
+        return base
+    suffix = "/" + path.lstrip("/")
+    if base.endswith(suffix):
+        return base
+    return base + suffix
+
+
+def _api_headers(key: str, auth_header: str, auth_prefix: str, extra_json: str) -> dict[str, str]:
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if key and auth_header:
+        headers[auth_header] = f"{auth_prefix}{key}"
+    if extra_json:
+        try:
+            extra = json.loads(extra_json)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Некорректный JSON в дополнительных заголовках API: {exc}") from exc
+        if not isinstance(extra, dict):
+            raise RuntimeError("Дополнительные заголовки API должны быть JSON-объектом.")
+        headers.update({str(k): str(v) for k, v in extra.items()})
+    return headers
+
+
+def _template_value(value: Any, variables: dict[str, Any]) -> Any:
+    if isinstance(value, dict):
+        return {k: _template_value(v, variables) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_template_value(v, variables) for v in value]
+    if isinstance(value, str):
+        token = re.fullmatch(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}", value)
+        if token and token.group(1) in variables:
+            return variables[token.group(1)]
+        for name, replacement in variables.items():
+            if isinstance(replacement, (str, int, float, bool)):
+                value = value.replace("{{" + name + "}}", str(replacement))
+        return value
+    return value
+
+
+def _build_template(template_text: str, variables: dict[str, Any]) -> dict[str, Any]:
+    if not template_text:
+        raise RuntimeError("Режим custom_json требует JSON-шаблон тела запроса.")
+    try:
+        template = json.loads(template_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Некорректный JSON-шаблон API: {exc}") from exc
+    if not isinstance(template, dict):
+        raise RuntimeError("Шаблон API должен быть JSON-объектом.")
+    result = _template_value(template, variables)
+    if not isinstance(result, dict):
+        raise RuntimeError("После подстановки шаблона тело API должно быть объектом.")
+    return result
+
+
+def _response_path(value: Any, path: str) -> Any:
+    current = value
+    if not path:
+        return current
+    for part in path.split("."):
+        if isinstance(current, list) and part.isdigit():
+            idx = int(part)
+            if idx >= len(current):
+                raise RuntimeError(f"Путь ответа '{path}' выходит за пределы массива.")
+            current = current[idx]
+        elif isinstance(current, dict) and part in current:
+            current = current[part]
+        else:
+            raise RuntimeError(f"В JSON-ответе API отсутствует поле '{part}' (путь: {path}).")
+    return current
+
+
 async def call_ai(prompt: str, history: list[dict], image: tuple[str, str] | None):
     if not AI_KEY:
         raise RuntimeError("Не задан AI_API_KEY.")
+    if not AI_BASE:
+        raise RuntimeError("Не задан AI_API_BASE_URL.")
     if not AI_MODEL:
-        raise RuntimeError("Не задан AI_MODEL — укажи slug модели.")
+        raise RuntimeError("Не задан AI_MODEL — укажи точное имя модели провайдера.")
     messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
     if image:
         mime, encoded = image
@@ -327,31 +406,60 @@ async def call_ai(prompt: str, history: list[dict], image: tuple[str, str] | Non
     else:
         user_content = prompt
     messages.append({"role": "user", "content": user_content})
-    endpoint = f"{AI_BASE}/chat/completions"
     last_error = "неизвестная ошибка"
+    endpoint = _endpoint(AI_BASE, AI_PATH)
+    headers = _api_headers(AI_KEY, AI_AUTH_HEADER, AI_AUTH_PREFIX, AI_EXTRA_HEADERS)
+
     async with ai_lock:
         async with httpx.AsyncClient(timeout=AI_TIMEOUT) as client:
             for model in [AI_MODEL, *AI_MODELS]:
-                body = {"model": model, "messages": messages, "temperature": 0.3,
-                        "max_tokens": AI_TOKENS, "response_format": {"type": "json_object"}}
-                headers = {"Authorization": f"Bearer {AI_KEY}", "Content-Type": "application/json"}
+                variables = {
+                    "model": model,
+                    "messages": messages,
+                    "history": history,
+                    "prompt": prompt,
+                    "user_content": user_content,
+                    "system_prompt": SYSTEM_PROMPT,
+                    "max_tokens": AI_TOKENS,
+                    "temperature": AI_TEMPERATURE,
+                    "image": ({"mime_type": image[0], "base64": image[1]} if image else None),
+                }
+                if AI_MODE == "custom_json":
+                    body = _build_template(AI_REQUEST_TEMPLATE, variables)
+                elif AI_MODE == "openai_chat":
+                    body = {
+                        "model": model,
+                        "messages": messages,
+                        "temperature": AI_TEMPERATURE,
+                        "max_tokens": AI_TOKENS,
+                        "response_format": {"type": "json_object"},
+                    }
+                else:
+                    raise RuntimeError(
+                        f"Неизвестный AI_API_MODE='{AI_MODE}'. Используй openai_chat или custom_json."
+                    )
                 try:
                     response = await client.post(endpoint, headers=headers, json=body)
-                    if response.status_code in {400, 422}:
-                        body.pop("response_format", None)
-                        response = await client.post(endpoint, headers=headers, json=body)
+                    if response.status_code in {400, 422} and AI_MODE == "openai_chat":
+                        # Some compatible APIs do not support the JSON response_format.
+                        retry_body = dict(body)
+                        retry_body.pop("response_format", None)
+                        response = await client.post(endpoint, headers=headers, json=retry_body)
                     response.raise_for_status()
-                    raw = response.json()["choices"][0]["message"]["content"]
+                    payload = response.json()
+                    raw = _response_path(payload, AI_RESPONSE_PATH)
                     if isinstance(raw, list):
-                        raw = "".join(str(x.get("text", "")) for x in raw if isinstance(x, dict))
+                        raw = "".join(str(item.get("text", "")) for item in raw if isinstance(item, dict))
+                    if isinstance(raw, dict):
+                        raw = json.dumps(raw, ensure_ascii=False)
                     if not str(raw).strip():
-                        raise RuntimeError("Модель вернула пустой ответ")
+                        raise RuntimeError("Модель вернула пустой ответ.")
                     answer, speech = parse_ai_result(str(raw))
                     return answer, speech, model
                 except Exception as exc:
                     last_error = f"{model}: {exc}"
-                    log.warning("AI model failed: %s", last_error)
-    raise RuntimeError(f"Все модели ИИ завершились ошибкой: {last_error[:700]}")
+                    log.warning("AI request failed (%s): %s", model, exc)
+    raise RuntimeError(f"Все модели ИИ завершились ошибкой. Последняя ошибка: {last_error[:700]}")
 
 
 def split_speech(text: str, limit: int) -> list[str]:

@@ -1,0 +1,42 @@
+services:
+  - type: web
+    name: chatai
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ALLOWED_USER_IDS
+        sync: false
+      - key: ARCHIVE_CHANNEL_ID
+        sync: false
+      - key: AI_API_KEY
+        sync: false
+      - key: AI_API_BASE_URL
+        value: https://openrouter.ai/api/v1
+      - key: AI_MODEL
+        value: openrouter/free
+      - key: AI_FALLBACK_MODELS
+        value: ""
+      - key: TTS_API_KEY
+        sync: false
+      - key: TTS_API_BASE_URL
+        value: https://openrouter.ai/api/v1
+      - key: TTS_MODEL
+        value: fish-audio/s2.1-pro-free:free
+      - key: TTS_FALLBACK_MODELS
+        value: ""
+      - key: TTS_DEFAULT_VOICE
+        value: default
+      - key: TTS_DEFAULT_SPEED
+        value: "1.0"
+      - key: TTS_CHUNK_CHARS
+        value: "2600"
+      - key: TTS_MAX_CHARS
+        value: "24000"
+      - key: DATA_DIR
+        value: /tmp/chatai-data
+      - key: WEBHOOK_SECRET
+        generateValue: true

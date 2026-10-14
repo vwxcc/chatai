@@ -329,7 +329,12 @@ def _endpoint(base: str, path: str) -> str:
 def _api_headers(key: str, auth_header: str, auth_prefix: str, extra_json: str) -> dict[str, str]:
     headers: dict[str, str] = {"Content-Type": "application/json"}
     if key and auth_header:
-        headers[auth_header] = f"{auth_prefix}{key}"
+        # dotenv/YAML parsers may trim trailing spaces in e.g. "Bearer ".
+        # So "Bearer" is treated as the conventional "Bearer " prefix.
+        normalized_prefix = auth_prefix
+        if normalized_prefix and not normalized_prefix[-1].isspace():
+            normalized_prefix += " "
+        headers[auth_header] = f"{normalized_prefix}{key}"
     if extra_json:
         try:
             extra = json.loads(extra_json)

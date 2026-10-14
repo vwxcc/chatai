@@ -528,7 +528,9 @@ async def cmd_settings(message: Message):
     if not await require_access(message):
         return
     voice, speed = await get_prefs(message.from_user.id)
-    await message.answer(f"Голос: {voice}\nСкорость: {speed:g}x\nИзменить: /voice nova, /speed 1.1")
+    shown_voice = voice or "голос провайдера по умолчанию"
+    note = "\nУ текущей Fish Audio модели нет стандартных preset-голосов." if TTS_MODEL.startswith("fish-audio/") else ""
+    await message.answer(f"Голос: {shown_voice}\nСкорость: {speed:g}x{note}\nИзменить: /voice nova, /speed 1.1")
 
 
 @dp.message(Command("voice"))
@@ -545,7 +547,12 @@ async def cmd_voice(message: Message):
         await message.answer("Не удалось прочитать имя голоса.")
         return
     await set_prefs(message.from_user.id, voice=voice)
-    await message.answer(f"Голос установлен: {voice}. Поддержка зависит от TTS-модели.")
+    if TTS_MODEL.startswith("fish-audio/"):
+        await message.answer(
+            f"Настройка сохранена: {voice}. Но текущая Fish Audio модель не использует стандартные имена голосов; "
+            "будет выбран голос провайдера по умолчанию. Чтобы выбирать именованные голоса, укажи совместимую TTS_MODEL.")
+    else:
+        await message.answer(f"Голос установлен: {voice}. Поддержка зависит от TTS-модели.")
 
 
 @dp.message(Command("speed"))
@@ -566,7 +573,12 @@ async def cmd_speed(message: Message):
         await message.answer("Допустимая скорость: от 0.5 до 2.0.")
         return
     await set_prefs(message.from_user.id, speed=speed)
-    await message.answer(f"Скорость установлена: {speed:g}x.")
+    if TTS_MODEL.startswith(("openai/", "azure/")):
+        await message.answer(f"Скорость установлена: {speed:g}x.")
+    else:
+        await message.answer(
+            f"Скорость сохранена: {speed:g}x, но текущая TTS-модель может игнорировать скорость. "
+            "У Fish Audio этот параметр не отправляется, поскольку модель его не поддерживает.")
 
 
 async def archive_result(message: Message, prompt: str, answer: str,

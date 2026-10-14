@@ -462,3 +462,208 @@ async def get_image(message: Message):
     if len(data) > MAX_IMAGE:
         raise RuntimeError(f"Изображение больше лимита {MAX_IMAGE // (1024 * 1024)} МБ.")
     return mime, base64.b64encode(data).decode("ascii")
+
+
+def is_allowed(message: Message) -> bool:
+    return (message.chat.type == ChatType.PRIVATE and message.from_user is not None
+            and bool(ALLOWED) and message.from_user.id in ALLOWED)
+
+
+async def require_access(message: Message) -> bool:
+    if is_allowed(message):
+        return True
+    if message.chat.type == ChatType.PRIVATE:
+        uid = message.from_user.id if message.from_user else "unknown"
+        if not ALLOWED:
+            await message.answer(
+                f"Бот пока закрыт. Твой Telegram ID: {uid}\n"
+                "Добавь этот ID в переменную ALLOWED_USER_IDS в настройках сервиса.")
+        else:
+            await message.answer(f"Доступ закрыт. Твой Telegram ID: {uid}")
+    return False
+
+
+@dp.message(Command("id"))
+async def cmd_id(message: Message):
+    uid = message.from_user.id if message.from_user else "unknown"
+    await message.answer(f"Твой Telegram ID: {uid}")
+
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    if not await require_access(message):
+        return
+    await message.answer(
+        "Привет! Я отдельный ИИ-ответчик с озвучкой.\n\n"
+        "Пришли вопрос, задачу или фото. Я отправлю ответ текстом, голосовым сообщением "
+        "и отдельным MP3, который можно сохранить на телефон.\n\n"
+        "/new — новый диалог\n/voice alloy — выбрать голос\n/speed 1.1 — скорость\n"
+        "/settings — настройки\n/help — справка")
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    if not await require_access(message):
+        return
+    await message.answer(
+        "Отправляй текст вопроса или фотографию задания.\n\n"
+        "/new — очистить историю диалога\n/voice alloy — выбрать голос TTS\n"
+        "/speed 1.1 — скорость от 0.5 до 2.0\n/settings — текущие настройки\n/id — Telegram ID")
+
+
+@dp.message(Command("new"))
+async def cmd_new(message: Message):
+    if not await require_access(message):
+        return
+    await reset_history(message.from_user.id)
+    await message.answer("Готово. История диалога очищена.")
+
+
+@dp.message(Command("settings"))
+async def cmd_settings(message: Message):
+    if not await require_access(message):
+        return
+    voice, speed = await get_prefs(message.from_user.id)
+    await message.answer(f"Голос: {voice}\nСкорость: {speed:g}x\nИзменить: /voice nova, /speed 1.1")
+
+
+@dp.message(Command("voice"))
+async def cmd_voice(message: Message):
+    if not await require_access(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        voice, _ = await get_prefs(message.from_user.id)
+        await message.answer(f"Текущий голос: {voice}\nПример: /voice nova")
+        return
+    voice = re.sub(r"[^A-Za-z0-9_:\-]", "", parts[1])[:80]
+    if not voice:
+        await message.answer("Не удалось прочитать имя голоса.")
+        return
+    await set_prefs(message.from_user.id, voice=voice)
+    await message.answer(f"Голос установлен: {voice}. Поддержка зависит от TTS-модели.")
+
+
+@dp.message(Command("speed"))
+async def cmd_speed(message: Message):
+    if not await require_access(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        _, speed = await get_prefs(message.from_user.id)
+        await message.answer(f"Текущая скорость: {speed:g}x\nПример: /speed 1.1")
+        return
+    try:
+        speed = float(parts[1].replace(",", "."))
+    except ValueError:
+        await message.answer("Укажи число от 0.5 до 2.0.")
+        return
+    if not 0.5 <= speed <= 2.0:
+        await message.answer("Допустимая скорость: от 0.5 до 2.0.")
+        return
+    await set_prefs(message.from_user.id, speed=speed)
+    await message.answer(f"Скорость установлена: {speed:g}x.")
+
+
+async def archive_result(message: Message, prompt: str, answer: str,
+                         voice_message: Message | None, audio_message: Message | None):
+    if not ARCHIVE:
+        return
+    answer_text = plain_html(answer)
+    record = (f"Вопрос от Telegram ID {message.from_user.id if message.from_user else 'unknown'}\n\n"
+              f"ВОПРОС:\n{prompt[:1200] or '[изображение без подписи]'}\n\n"
+              f"ОТВЕТ:\n{answer_text[:2400]}")
+    try:
+        for chunk in split_text(record):
+            await message.bot.send_message(ARCHIVE, chunk, disable_web_page_preview=True)
+        if voice_message:
+            await message.bot.copy_message(ARCHIVE, voice_message.chat.id, voice_message.message_id)
+        if audio_message:
+            await message.bot.copy_message(ARCHIVE, audio_message.chat.id, audio_message.message_id)
+    except Exception:
+        log.exception("Failed to save answer to archive channel")
+        await message.answer(
+            "Ответ готов, но копирование в канал не удалось. Проверь ARCHIVE_CHANNEL_ID "
+            "и право бота на публикацию.")
+
+
+@dp.message(F.text | F.photo | F.document)
+async def handle_question(message: Message):
+    if not await require_access(message) or not message.from_user:
+        return
+    prompt = (message.text or message.caption or "").strip()
+    if message.document and not message.photo:
+        mime = message.document.mime_type or ""
+        if not mime.startswith("image/"):
+            await message.answer("Сейчас поддерживаю текст, фотографии и изображения как документы.")
+            return
+    if not prompt and not message.photo and not message.document:
+        await message.answer("Пришли текст вопроса или фотографию задания.")
+        return
+    if len(prompt) > MAX_PROMPT:
+        await message.answer(f"Сообщение слишком длинное. Лимит: {MAX_PROMPT} символов.")
+        return
+    try:
+        image = await get_image(message)
+    except Exception as exc:
+        await message.answer(f"Не получилось загрузить изображение: {str(exc)[:400]}")
+        return
+    if image and not prompt:
+        prompt = "Реши задачу на изображении. Перепиши условие, объясни решение и проверь ответ."
+    if not prompt:
+        prompt = "Проанализируй изображение и объясни, что на нём изображено."
+
+    status = await message.answer("Думаю над ответом…")
+    try:
+        history = await get_history(message.from_user.id)
+        answer, speech, model = await call_ai(prompt, history, image)
+        await save_turn(message.from_user.id, prompt, plain_html(answer))
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        await send_answer(message, answer)
+
+        if not TTS_KEY:
+            await message.answer("Текст готов. Для аудио добавь TTS_API_KEY или AI_API_KEY.")
+            await archive_result(message, prompt, answer, None, None)
+            return
+
+        audio_status = await message.answer("Готовлю голосовое и MP3…")
+        voice_msg = None
+        audio_msg = None
+        try:
+            voice, speed = await get_prefs(message.from_user.id)
+            with tempfile.TemporaryDirectory(prefix="chatai-") as folder:
+                mp3, ogg, tts_models = await make_audio(speech, voice, speed, folder)
+                if mp3.stat().st_size > 49 * 1024 * 1024:
+                    raise RuntimeError("MP3 превышает лимит Telegram примерно в 50 МБ.")
+                if ogg and ogg.stat().st_size <= 49 * 1024 * 1024:
+                    voice_msg = await message.answer_voice(FSInputFile(ogg, filename="answer.ogg"))
+                else:
+                    try:
+                        voice_msg = await message.answer_voice(FSInputFile(mp3, filename="answer.mp3"))
+                    except Exception as exc:
+                        log.warning("MP3 voice-note fallback failed: %s", exc)
+                audio_msg = await message.answer_audio(
+                    FSInputFile(mp3, filename="answer.mp3"),
+                    title="Ответ ИИ", performer="chatai",
+                    caption="MP3 — можно скачать и сохранить на телефон.")
+                log.info("AI model=%s TTS=%s user=%s", model, tts_models, message.from_user.id)
+        except Exception as exc:
+            log.exception("TTS failed for user %s", message.from_user.id)
+            await message.answer(
+                "Текстовый ответ готов, но аудио создать не удалось. Проверь TTS-модель, ключ и лимиты.\n"
+                f"Ошибка: {str(exc)[:600]}")
+        finally:
+            try:
+                await audio_status.delete()
+            except Exception:
+                pass
+        await archive_result(message, prompt, answer, voice_msg, audio_msg)
+    except Exception as exc:
+        log.exception("AI request failed for user %s", message.from_user.id)
+        try:
+            await status.edit_text(f"Не получилось завершить запрос: {str(exc)[:800]}")
+        except Exception:
+            await message.answer(f"Не получилось завершить запрос: {str(exc)[:800]}")

@@ -667,3 +667,75 @@ async def handle_question(message: Message):
             await status.edit_text(f"Не получилось завершить запрос: {str(exc)[:800]}")
         except Exception:
             await message.answer(f"Не получилось завершить запрос: {str(exc)[:800]}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global bot, polling_task
+    await init_db()
+    if not BOT_TOKEN:
+        log.error("TELEGRAM_BOT_TOKEN is missing; bot handlers are disabled.")
+        yield
+        return
+    bot = Bot(token=BOT_TOKEN)
+    try:
+        if PUBLIC_URL:
+            await bot.set_webhook(
+                url=f"{PUBLIC_URL}{HOOK_PATH}",
+                secret_token=HOOK_SECRET,
+                allowed_updates=dp.resolve_used_update_types(),
+                drop_pending_updates=False,
+            )
+            log.info("Webhook configured: %s%s", PUBLIC_URL, HOOK_PATH)
+        else:
+            await bot.delete_webhook(drop_pending_updates=False)
+            polling_task = asyncio.create_task(dp.start_polling(bot, close_bot_session=False))
+            log.info("Bot started in polling mode.")
+        yield
+    finally:
+        if polling_task:
+            polling_task.cancel()
+            try:
+                await polling_task
+            except asyncio.CancelledError:
+                pass
+            polling_task = None
+        if bot:
+            await bot.session.close()
+            bot = None
+
+
+app = FastAPI(title="chatai Telegram bot", version="1.0.0", lifespan=lifespan)
+
+
+@app.get("/")
+async def root():
+    return {"service": "chatai", "status": "ok", "health": "/healthz"}
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok", "bot": "configured" if BOT_TOKEN else "token_missing"}
+
+
+@app.post(HOOK_PATH)
+async def telegram_webhook(request: Request):
+    if bot is None:
+        raise HTTPException(status_code=503, detail="Bot is not initialised")
+    if not PUBLIC_URL:
+        raise HTTPException(status_code=404, detail="Webhook mode is disabled")
+    received = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not received or not hmac.compare_digest(received, HOOK_SECRET):
+        raise HTTPException(status_code=403, detail="Invalid webhook secret")
+    try:
+        update = Update.model_validate(await request.json(), context={"bot": bot})
+        await dp.feed_update(bot, update)
+    except Exception:
+        log.exception("Telegram webhook update failed")
+        raise HTTPException(status_code=500, detail="Update processing failed")
+    return JSONResponse({"ok": True})
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))

@@ -36,20 +36,43 @@ ALLOWED = {int(x.strip()) for x in os.getenv("ALLOWED_USER_IDS", "").split(",")
            if x.strip().isdigit()}
 ARCHIVE = os.getenv("ARCHIVE_CHANNEL_ID", "").strip() or None
 
+# Main LLM API: OpenAI-compatible by default, with custom JSON mode for other providers.
 AI_KEY = os.getenv("AI_API_KEY", "").strip()
-AI_BASE = os.getenv("AI_API_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+AI_BASE = os.getenv("AI_API_BASE_URL", "").strip().rstrip("/")
+AI_PATH = os.getenv("AI_API_PATH", "/chat/completions").strip()
+AI_MODE = os.getenv("AI_API_MODE", "openai_chat").strip().lower()
 AI_MODEL = os.getenv("AI_MODEL", "").strip()
 AI_MODELS = [x.strip() for x in os.getenv("AI_FALLBACK_MODELS", "").split(",") if x.strip()]
+AI_AUTH_HEADER = os.getenv("AI_AUTH_HEADER", "Authorization").strip()
+AI_AUTH_PREFIX = os.getenv("AI_AUTH_PREFIX", "Bearer ").replace("\\t", "\t")
+AI_EXTRA_HEADERS = os.getenv("AI_EXTRA_HEADERS_JSON", "{}").strip()
+AI_REQUEST_TEMPLATE = os.getenv("AI_REQUEST_TEMPLATE_JSON", "").strip()
+AI_RESPONSE_PATH = os.getenv("AI_RESPONSE_TEXT_PATH", "choices.0.message.content").strip()
 AI_TIMEOUT = float(os.getenv("AI_TIMEOUT", "180"))
 AI_TOKENS = int(os.getenv("AI_MAX_TOKENS", "7000"))
+AI_TEMPERATURE = float(os.getenv("AI_TEMPERATURE", "0.3"))
 MAX_PROMPT = int(os.getenv("MAX_PROMPT_CHARS", "30000"))
 MAX_IMAGE = int(os.getenv("MAX_IMAGE_BYTES", str(12 * 1024 * 1024)))
 HISTORY_LIMIT = int(os.getenv("HISTORY_MESSAGES", "16"))
 
+# Voice API is intentionally independent: its base URL, key, auth, request and response can differ.
 TTS_KEY = os.getenv("TTS_API_KEY", "").strip() or AI_KEY
-TTS_BASE = os.getenv("TTS_API_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
-TTS_MODEL = os.getenv("TTS_MODEL", "fish-audio/s2.1-pro-free:free").strip()
+TTS_BASE = os.getenv("TTS_API_BASE_URL", "").strip().rstrip("/")
+TTS_PATH = os.getenv("TTS_API_PATH", "/audio/speech").strip()
+TTS_MODE = os.getenv("TTS_API_MODE", "openai_speech").strip().lower()
+TTS_MODEL = os.getenv("TTS_MODEL", "").strip()
 TTS_MODELS = [x.strip() for x in os.getenv("TTS_FALLBACK_MODELS", "").split(",") if x.strip()]
+TTS_AUTH_HEADER = os.getenv("TTS_AUTH_HEADER", "Authorization").strip()
+TTS_AUTH_PREFIX = os.getenv("TTS_AUTH_PREFIX", "Bearer ").replace("\\t", "\t")
+TTS_EXTRA_HEADERS = os.getenv("TTS_EXTRA_HEADERS_JSON", "{}").strip()
+TTS_REQUEST_TEMPLATE = os.getenv("TTS_REQUEST_TEMPLATE_JSON", "").strip()
+TTS_RESPONSE_MODE = os.getenv("TTS_RESPONSE_MODE", "raw_audio").strip().lower()
+TTS_RESPONSE_AUDIO_PATH = os.getenv("TTS_RESPONSE_AUDIO_PATH", "audio").strip()
+TTS_RESPONSE_URL_PATH = os.getenv("TTS_RESPONSE_URL_PATH", "audio_url").strip()
+TTS_VOICE_FIELD = os.getenv("TTS_VOICE_FIELD", "voice").strip()
+TTS_SPEED_FIELD = os.getenv("TTS_SPEED_FIELD", "speed").strip()
+TTS_FORMAT_FIELD = os.getenv("TTS_FORMAT_FIELD", "response_format").strip()
+TTS_AUDIO_FORMAT = os.getenv("TTS_AUDIO_FORMAT", "mp3").strip()
 DEFAULT_VOICE = os.getenv("TTS_DEFAULT_VOICE", "").strip()
 DEFAULT_SPEED = float(os.getenv("TTS_DEFAULT_SPEED", "1.0"))
 TTS_CHUNK = max(600, min(int(os.getenv("TTS_CHUNK_CHARS", "2600")), 4500))

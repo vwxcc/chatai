@@ -406,6 +406,17 @@ async def call_ai(prompt: str, history: list[dict], image: tuple[str, str] | Non
     else:
         user_content = prompt
     messages.append({"role": "user", "content": user_content})
+    conversation = [*history, {"role": "user", "content": user_content}]
+    provider_conversation = [*history]
+    if image:
+        mime, encoded = image
+        provider_content: Any = [
+            {"type": "text", "text": prompt or "Реши задачу на изображении."},
+            {"type": "image", "source": {"type": "base64", "media_type": mime, "data": encoded}},
+        ]
+    else:
+        provider_content = prompt
+    provider_conversation.append({"role": "user", "content": provider_content})
     last_error = "неизвестная ошибка"
     endpoint = _endpoint(AI_BASE, AI_PATH)
     headers = _api_headers(AI_KEY, AI_AUTH_HEADER, AI_AUTH_PREFIX, AI_EXTRA_HEADERS)
@@ -416,6 +427,8 @@ async def call_ai(prompt: str, history: list[dict], image: tuple[str, str] | Non
                 variables = {
                     "model": model,
                     "messages": messages,
+                    "conversation": conversation,
+                    "provider_conversation": provider_conversation,
                     "history": history,
                     "prompt": prompt,
                     "user_content": user_content,
@@ -423,6 +436,8 @@ async def call_ai(prompt: str, history: list[dict], image: tuple[str, str] | Non
                     "max_tokens": AI_TOKENS,
                     "temperature": AI_TEMPERATURE,
                     "image": ({"mime_type": image[0], "base64": image[1]} if image else None),
+                    "image_mime_type": image[0] if image else "",
+                    "image_base64": image[1] if image else "",
                 }
                 if AI_MODE == "custom_json":
                     body = _build_template(AI_REQUEST_TEMPLATE, variables)

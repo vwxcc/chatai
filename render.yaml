@@ -28,7 +28,7 @@ services:
       - key: AI_AUTH_HEADER
         value: Authorization
       - key: AI_AUTH_PREFIX
-        value: "Bearer "
+        value: Bearer
       - key: AI_EXTRA_HEADERS_JSON
         value: "{}"
       - key: AI_REQUEST_TEMPLATE_JSON

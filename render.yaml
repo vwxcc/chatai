@@ -29,7 +29,7 @@ services:
       - key: TTS_FALLBACK_MODELS
         value: ""
       - key: TTS_DEFAULT_VOICE
-        value: default
+        value: ""
       - key: TTS_DEFAULT_SPEED
         value: "1.0"
       - key: TTS_CHUNK_CHARS

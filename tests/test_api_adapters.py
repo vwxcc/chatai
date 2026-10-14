@@ -59,6 +59,10 @@ class APIAdapterTests(unittest.TestCase):
         self.assertEqual(headers["x-api-key"], "secret")
         self.assertEqual(headers["anthropic-version"], "2023-06-01")
 
+    def test_bearer_prefix_adds_separator_even_if_config_trims_spaces(self):
+        headers = main._api_headers("secret", "Authorization", "Bearer", "{}")
+        self.assertEqual(headers["Authorization"], "Bearer secret")
+
     def test_ai_output_json_has_separate_speech_text(self):
         answer, speech = main.parse_ai_result(
             '{"answer_html":"<b>Привет</b>","speech_text":"Привет!"}'

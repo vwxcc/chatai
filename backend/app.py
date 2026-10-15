@@ -815,7 +815,123 @@ def _run_post_response_tasks(chat_id:int, user_id:int):
         import logging
         logging.exception("Post-response AI tasks failed for chat_id=%s",chat_id)
 
-app = FastAPI(title="ChatStudio API",version="0.1.0")
+
+def _safe_volatile_message(message: dict[str, Any]) -> dict[str, Any]:
+    role = str(message.get("role") or "user")
+    content = message.get("content", "")
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text":
+                parts.append(str(part.get("text") or ""))
+            elif part.get("type") in {"image_url", "image"}:
+                parts.append("[изображение из предыдущего сообщения]")
+        content = "\\n".join(x for x in parts if x)
+    text_value = str(content or "")
+    if len(text_value) > VOLATILE_HISTORY_CHARS:
+        text_value = text_value[:VOLATILE_HISTORY_CHARS] + "\\n[Контекст сокращён]"
+    return {"role": role, "content": text_value}
+
+
+def _with_volatile_history(user_id: int, chat_id: int, current_messages):
+    with VOLATILE_HISTORY_LOCK:
+        previous = list(VOLATILE_HISTORY.get((user_id, chat_id), []))
+    return [*previous, *current_messages]
+
+
+def _remember_volatile_history(user_id: int, chat_id: int, messages, answer: str):
+    compact = [_safe_volatile_message(item) for item in messages]
+    compact.append(_safe_volatile_message({"role": "assistant", "content": answer}))
+    compact = compact[-VOLATILE_HISTORY_MESSAGES:]
+    total, bounded = 0, []
+    for item in reversed(compact):
+        length = len(str(item.get("content", "")))
+        if bounded and total + length > VOLATILE_HISTORY_CHARS * 8:
+            break
+        bounded.append(item)
+        total += length
+    bounded.reverse()
+    with VOLATILE_HISTORY_LOCK:
+        key = (user_id, chat_id)
+        VOLATILE_HISTORY.pop(key, None)
+        VOLATILE_HISTORY[key] = bounded
+        while len(VOLATILE_HISTORY) > VOLATILE_HISTORY_MAX_SESSIONS:
+            VOLATILE_HISTORY.pop(next(iter(VOLATILE_HISTORY)), None)
+
+
+def _split_payload(text: str, limit: int) -> list[str]:
+    remaining, result = (text or "").strip(), []
+    while remaining:
+        if len(remaining) <= limit:
+            result.append(remaining)
+            break
+        cut = max(remaining.rfind("\\n", 0, limit), remaining.rfind(" ", 0, limit))
+        if cut < limit // 2:
+            cut = limit
+        result.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+    return [part for part in result if part]
+
+
+def _purge_chat_content(chat_id: int, user_id: int, extra_file_ids=None):
+    """Purge durable transcript/request rows and temporary uploads after response."""
+    paths = []
+    with closing(get_db()) as db:
+        attached = db.execute(
+            "SELECT DISTINCT f.id,f.path FROM files f JOIN message_files mf ON mf.file_id=f.id "
+            "JOIN messages m ON m.id=mf.message_id WHERE f.user_id=? AND m.chat_id=?",
+            (user_id, chat_id),
+        ).fetchall()
+        file_map = {int(row["id"]): row["path"] for row in attached}
+        for value in (extra_file_ids or []):
+            try:
+                file_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            row = db.execute("SELECT path FROM files WHERE id=? AND user_id=?", (file_id, user_id)).fetchone()
+            if row:
+                file_map[file_id] = row["path"]
+        paths = list(file_map.values())
+        db.execute("DELETE FROM messages WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+        db.execute("DELETE FROM chat_suggestions WHERE chat_id=?", (chat_id,))
+        db.execute("DELETE FROM chat_shares WHERE chat_id=?", (chat_id,))
+        db.execute("DELETE FROM ai_requests WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+        if file_map:
+            placeholders = ",".join("?" for _ in file_map)
+            db.execute(f"DELETE FROM files WHERE user_id=? AND id IN ({placeholders})", (user_id, *file_map.keys()))
+        db.commit()
+    for raw_path in paths:
+        try:
+            path = Path(raw_path).resolve()
+            path.relative_to(UPLOAD_DIR.resolve())
+            path.unlink(missing_ok=True)
+        except Exception:
+            logging.warning("Could not remove temporary upload file")
+
+
+def _purge_persisted_content_on_startup():
+    """Erase legacy transcripts and uploaded files from any earlier build."""
+    with closing(get_db()) as db:
+        paths = [row["path"] for row in db.execute("SELECT path FROM files").fetchall()]
+        db.execute("DELETE FROM messages")
+        db.execute("DELETE FROM chat_suggestions")
+        db.execute("DELETE FROM chat_shares")
+        db.execute("DELETE FROM files")
+        db.execute("DELETE FROM ai_requests")
+        db.execute("UPDATE chats SET title='Новый чат', archived=0, updated_at=?", (now_iso(),))
+        db.execute("DELETE FROM chats WHERE id NOT IN (SELECT MAX(id) FROM chats GROUP BY user_id)")
+        db.commit()
+    for raw_path in paths:
+        try:
+            path = Path(raw_path).resolve()
+            path.relative_to(UPLOAD_DIR.resolve())
+            path.unlink(missing_ok=True)
+        except Exception:
+            logging.warning("Could not remove legacy uploaded file")
+
+app = FastAPI(title="ai-ch API",version="1.0.0")
 
 @app.middleware("http")
 async def same_origin_api_middleware(request: Request, call_next):

@@ -22,4 +22,4 @@ RUN mkdir -p /app/data
 EXPOSE 10000
 
 # exec ensures uvicorn receives shutdown/restart signals directly.
-CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port \${PORT:-10000}"]
+CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port $(printenv PORT || echo 10000)"]

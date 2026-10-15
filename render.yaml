@@ -1,0 +1,70 @@
+services:
+  - type: web
+    name: ai-ch
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    envVars:
+      - key: PORT
+        value: "10000"
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: SESSION_COOKIE_SECURE
+        value: "1"
+      - key: CSRF_PROTECTION
+        value: "1"
+      - key: DATA_DIR
+        value: /tmp/ai-ch-data
+      - key: UPLOAD_DIR
+        value: /tmp/ai-ch-uploads
+      - key: FRONTEND_DIR
+        value: /app/frontend
+      - key: GLOBAL_AI_CONCURRENCY
+        value: "2"
+      - key: REQUEST_TIMEOUT
+        value: "300"
+      - key: AI_API_BASE_URL
+        value: https://llm.stage.satel.org/v1
+      - key: AI_API_KEY
+        sync: false
+      - key: AI_API_KEY_ENV
+        value: AI_API_KEY
+      - key: AI_MODEL
+        value: qwen36-35b
+      - key: AI_FALLBACK_MODELS
+        value: ""
+      - key: AI_TEMPERATURE
+        value: "0.2"
+      - key: AI_MAX_TOKENS
+        value: "7000"
+      - key: TTS_API_BASE_URL
+        value: https://openrouter.ai/api/v1
+      - key: TTS_API_PATH
+        value: /audio/speech
+      - key: TTS_API_KEY
+        sync: false
+      - key: TTS_MODEL
+        value: fish-audio/s2.1-pro-free:free
+      - key: TTS_VOICE
+        value: ""
+      - key: TTS_AUDIO_FORMAT
+        value: mp3
+      - key: TTS_TIMEOUT
+        value: "120"
+      - key: TTS_CHUNK_CHARS
+        value: "2600"
+      - key: TTS_MAX_CHARS
+        value: "24000"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ARCHIVE_CHANNEL_ID
+        sync: false
+      - key: TELEGRAM_TIMEOUT
+        value: "25"
+      - key: VOLATILE_HISTORY_MESSAGES
+        value: "12"
+      - key: VOLATILE_HISTORY_CHARS
+        value: "12000"
+      - key: VOLATILE_HISTORY_MAX_SESSIONS
+        value: "128"

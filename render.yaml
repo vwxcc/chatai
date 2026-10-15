@@ -89,6 +89,8 @@ services:
       - key: TTS_TIMEOUT
         value: "180"
 
+      - key: PORT
+        value: "10000"
       - key: DATA_DIR
         value: /tmp/chatai-data
       - key: WEBHOOK_SECRET

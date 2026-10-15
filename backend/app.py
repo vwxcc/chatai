@@ -1027,7 +1027,12 @@ def update_password(payload:PasswordUpdateRequest,request:Request):
 @app.post("/api/auth/logout")
 def logout(request:Request):
     _check_same_origin(request)
+    user_id = request.session.get("user_id")
     request.session.clear()
+    if user_id:
+        with VOLATILE_HISTORY_LOCK:
+            for key in [key for key in VOLATILE_HISTORY if key[0] == int(user_id)]:
+                VOLATILE_HISTORY.pop(key, None)
     return {"ok":True}
 
 @app.get("/api/auth/me")
@@ -1081,6 +1086,16 @@ def get_chat(chat_id:int,request:Request):
             item["files"]=[dict(x) for x in files]
             result.append(item)
     return {"chat":dict(chat),"messages":result}
+
+@app.post("/api/chats/{chat_id}/reset-context")
+def reset_chat_context(chat_id:int,request:Request):
+    user=current_user(request)
+    with closing(get_db()) as db:
+        get_owned_chat(db,chat_id,int(user["id"]))
+    with VOLATILE_HISTORY_LOCK:
+        VOLATILE_HISTORY.pop((int(user["id"]),chat_id),None)
+    return {"ok":True}
+
 
 @app.post("/api/chats/{chat_id}/share")
 def create_chat_share(chat_id:int,request:Request):
@@ -1183,6 +1198,8 @@ def delete_chat(chat_id:int,request:Request):
         get_owned_chat(db,chat_id,int(user["id"]))
         db.execute("DELETE FROM chats WHERE id=? AND user_id=?",(chat_id,user["id"]))
         db.commit()
+    with VOLATILE_HISTORY_LOCK:
+        VOLATILE_HISTORY.pop((int(user["id"]),chat_id),None)
     return {"ok":True}
 
 @app.get("/api/search")
@@ -1259,6 +1276,7 @@ def create_request(payload:MessageRequest,request:Request,background_tasks:Backg
         except Exception:
             db.rollback()
             update_ai_request(request_id,status="failed",error="Не удалось сохранить сообщение",completed_at=now_iso())
+            _purge_chat_content(payload.chat_id, int(user["id"]), payload.file_ids)
             raise
     try:
         mark_ai_request_processing(request_id)
@@ -1297,9 +1315,11 @@ def create_request(payload:MessageRequest,request:Request,background_tasks:Backg
     except RuntimeError as exc:
         status="cancelled" if str(exc)=="REQUEST_CANCELLED" else "failed"
         update_ai_request(request_id,status=status,error=str(exc),completed_at=now_iso())
+        _purge_chat_content(payload.chat_id, int(user["id"]), payload.file_ids)
         raise HTTPException(409 if status=="cancelled" else 502,"Запрос остановлен" if status=="cancelled" else "Не удалось сохранить ответ")
     except Exception as exc:
         update_ai_request(request_id,status="failed",error=str(exc)[:500],completed_at=now_iso())
+        _purge_chat_content(payload.chat_id, int(user["id"]), payload.file_ids)
         raise HTTPException(502,"Не удалось сохранить ответ")
     background_tasks.add_task(telegram_archive.publish_answer, content, result["content"], int(user["id"]), result["model"])
     _remember_volatile_history(int(user["id"]), payload.chat_id, ai_messages, result["content"])
@@ -1525,6 +1545,7 @@ def stream_request(payload:MessageRequest,request:Request,background_tasks:Backg
         except Exception:
             db.rollback()
             update_ai_request(request_id,status="failed",error="Не удалось сохранить сообщение",completed_at=now_iso())
+            _purge_chat_content(payload.chat_id, int(user["id"]), payload.file_ids)
             raise
     try:
         mark_ai_request_processing(request_id,user_message_id)
@@ -1535,7 +1556,7 @@ def stream_request(payload:MessageRequest,request:Request,background_tasks:Backg
         ai_messages=_with_volatile_history(int(user["id"]),payload.chat_id,_chat_ai_messages(db,payload.chat_id))
 
     def event(payload_data):
-        return "data: "+json.dumps(payload_data,ensure_ascii=False,separators=(",",":"))+"\\n\\n"
+        return "data: "+json.dumps(payload_data,ensure_ascii=False,separators=(",",":"))+"\n\n"
 
     def generate_events():
         full_content=[]

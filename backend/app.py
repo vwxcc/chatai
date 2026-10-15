@@ -829,10 +829,10 @@ def _safe_volatile_message(message: dict[str, Any]) -> dict[str, Any]:
                 parts.append(str(part.get("text") or ""))
             elif part.get("type") in {"image_url", "image"}:
                 parts.append("[изображение из предыдущего сообщения]")
-        content = "\\n".join(x for x in parts if x)
+        content = "\n".join(x for x in parts if x)
     text_value = str(content or "")
     if len(text_value) > VOLATILE_HISTORY_CHARS:
-        text_value = text_value[:VOLATILE_HISTORY_CHARS] + "\\n[Контекст сокращён]"
+        text_value = text_value[:VOLATILE_HISTORY_CHARS] + "\n[Контекст сокращён]"
     return {"role": role, "content": text_value}
 
 
@@ -868,7 +868,7 @@ def _split_payload(text: str, limit: int) -> list[str]:
         if len(remaining) <= limit:
             result.append(remaining)
             break
-        cut = max(remaining.rfind("\\n", 0, limit), remaining.rfind(" ", 0, limit))
+        cut = max(remaining.rfind("\n", 0, limit), remaining.rfind(" ", 0, limit))
         if cut < limit // 2:
             cut = limit
         result.append(remaining[:cut].strip())

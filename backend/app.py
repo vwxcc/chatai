@@ -1263,20 +1263,24 @@ def create_request(payload:MessageRequest,request:Request,background_tasks:Backg
     try:
         mark_ai_request_processing(request_id)
     except RuntimeError:
+        _purge_chat_content(payload.chat_id, int(user["id"]), payload.file_ids)
         raise HTTPException(409,"Запрос уже остановлен")
     with closing(get_db()) as db:
-        ai_messages=_with_volatile_history(int(user['id']),payload.chat_id,_chat_ai_messages(db,payload.chat_id))
+        ai_messages=_with_volatile_history(int(user["id"]),payload.chat_id,_chat_ai_messages(db,payload.chat_id))
     try:
         result=MODEL_ROUTER.generate("main_generation",ai_messages,cancel_check=lambda: is_ai_request_cancelled(request_id),request_id=request_id)
     except HTTPException as exc:
         update_ai_request(request_id,status="failed",error=str(exc.detail),completed_at=now_iso())
+        _purge_chat_content(payload.chat_id, int(user["id"]), payload.file_ids)
         raise
     except RuntimeError as exc:
         status="cancelled" if str(exc)=="REQUEST_CANCELLED" else "failed"
         update_ai_request(request_id,status=status,error=str(exc),completed_at=now_iso())
+        _purge_chat_content(payload.chat_id, int(user["id"]), payload.file_ids)
         raise HTTPException(502,"Запрос не выполнен")
     except Exception as exc:
         update_ai_request(request_id,status="failed",error=str(exc)[:500],completed_at=now_iso())
+        _purge_chat_content(payload.chat_id, int(user["id"]), payload.file_ids)
         raise HTTPException(502,"Запрос не выполнен")
     try:
         with closing(get_db()) as db:
@@ -1297,8 +1301,11 @@ def create_request(payload:MessageRequest,request:Request,background_tasks:Backg
     except Exception as exc:
         update_ai_request(request_id,status="failed",error=str(exc)[:500],completed_at=now_iso())
         raise HTTPException(502,"Не удалось сохранить ответ")
-    background_tasks.add_task(_run_post_response_tasks,payload.chat_id,int(user["id"]))
-    return {"status":"completed","request_id":request_id,"message":dict(user_message),"assistant":dict(assistant)}
+    background_tasks.add_task(telegram_archive.publish_answer, content, result["content"], int(user["id"]), result["model"])
+    _remember_volatile_history(int(user["id"]), payload.chat_id, ai_messages, result["content"])
+    response_user, response_assistant = dict(user_message), dict(assistant)
+    _purge_chat_content(payload.chat_id, int(user["id"]), payload.file_ids)
+    return {"status":"completed","request_id":request_id,"message":response_user,"assistant":response_assistant}
  
 class RoutingSetUpdateRequest(BaseModel):
     name: str | None = Field(default=None,min_length=1,max_length=120)
@@ -1522,9 +1529,10 @@ def stream_request(payload:MessageRequest,request:Request,background_tasks:Backg
     try:
         mark_ai_request_processing(request_id,user_message_id)
     except RuntimeError:
+        _purge_chat_content(payload.chat_id, int(user["id"]), payload.file_ids)
         raise HTTPException(409,"Запрос уже остановлен")
     with closing(get_db()) as db:
-        ai_messages=_chat_ai_messages(db,payload.chat_id)
+        ai_messages=_with_volatile_history(int(user["id"]),payload.chat_id,_chat_ai_messages(db,payload.chat_id))
 
     def event(payload_data):
         return "data: "+json.dumps(payload_data,ensure_ascii=False,separators=(",",":"))+"\\n\\n"
@@ -1565,7 +1573,8 @@ def stream_request(payload:MessageRequest,request:Request,background_tasks:Backg
                 db.commit()
                 assistant=db.execute("SELECT id,chat_id,user_id,role,content,model,provider,routing_set,parent_message_id,created_at FROM messages WHERE id=?",(cur.lastrowid,)).fetchone()
                 user_message=db.execute("SELECT id,chat_id,user_id,role,content,model,provider,routing_set,parent_message_id,created_at FROM messages WHERE id=?",(user_message_id,)).fetchone()
-            background_tasks.add_task(_run_post_response_tasks,payload.chat_id,int(user["id"]))
+            background_tasks.add_task(telegram_archive.publish_answer, content, final_content, int(user["id"]), selected["model"])
+            _remember_volatile_history(int(user["id"]), payload.chat_id, ai_messages, final_content)
             terminal=True
             yield event({"type":"complete","request_id":request_id,"message":dict(assistant),"user_message":dict(user_message)})
         except RuntimeError as exc:
@@ -1580,8 +1589,14 @@ def stream_request(payload:MessageRequest,request:Request,background_tasks:Backg
         finally:
             if not terminal:
                 update_ai_request(request_id,status="cancelled",cancel_requested=1,error="Клиентское соединение прервано",completed_at=now_iso())
+            _purge_chat_content(payload.chat_id, int(user["id"]), payload.file_ids)
 
-    return StreamingResponse(generate_events(),media_type="text/event-stream",headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+    return StreamingResponse(
+        generate_events(),
+        media_type="text/event-stream",
+        background=background_tasks,
+        headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"},
+    )
 
 @app.get("/api/requests/{request_id}")
 def get_request_status(request_id:int,request:Request):

@@ -1,10 +1,12 @@
 .git
 .github
-__pycache__
-*.py[cod]
-*.sqlite3
+.gitignore
 .env
-.venv
-venv
 data
 uploads
+__pycache__
+*.pyc
+*.pyo
+*.db
+*.sqlite
+*.sqlite3

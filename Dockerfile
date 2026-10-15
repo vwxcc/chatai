@@ -2,23 +2,20 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PORT=10000 \
-    DATA_DIR=/app/data
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+    DATA_DIR=/app/data \
+    UPLOAD_DIR=/app/uploads \
+    FRONTEND_DIR=/app/frontend
 
 WORKDIR /app
+
 COPY requirements.txt /app/requirements.txt
-RUN pip install -r /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY main.py /app/main.py
-RUN mkdir -p /app/data
+COPY backend /app/backend
+COPY frontend /app/frontend
 
-# Render forwards external HTTP traffic to the port configured in PORT.
-EXPOSE 10000
+RUN mkdir -p /app/data /app/uploads
 
-# exec ensures uvicorn receives shutdown/restart signals directly.
-CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port $(printenv PORT || echo 10000)"]
+EXPOSE 8000
+
+CMD ["uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "8000"]

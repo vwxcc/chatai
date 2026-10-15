@@ -6,7 +6,7 @@
 
 - Основная модель задаётся через `AI_API_BASE_URL`, `AI_API_KEY`, `AI_MODEL`; API должен быть совместим с OpenAI Chat Completions.
 - `AI_FALLBACK_MODELS` задаёт запасные модели через запятую.
-- Если в таблицах AI Router ещё нет маршрута, сайт автоматически использует ENV-модель. Существующие маршруты Router сохраняют приоритет.
+- По умолчанию основной ответ сайта использует ENV-модель прежде любых маршрутов в БД. Поставь `AI_ENV_PRIORITY=0`, чтобы разрешить маршруту AI Router иметь приоритет; ENV-модель также остаётся запасным вариантом, когда маршрут не настроен.
 - `GLOBAL_AI_CONCURRENCY` ограничивает количество одновременно выполняемых запросов к AI API на процесс приложения.
 - Независимый TTS API задаётся через `TTS_API_BASE_URL`, `TTS_API_PATH`, `TTS_API_KEY`, `TTS_MODEL`, `TTS_VOICE`. По умолчанию ожидается OpenAI-совместимый endpoint, возвращающий бинарный MP3.
 - Каждый завершённый ответ автоматически отправляется в Telegram-канал через `TELEGRAM_BOT_TOKEN` + `ARCHIVE_CHANNEL_ID`. При рабочей TTS-конфигурации дополнительно публикуются MP3-фрагменты.
@@ -21,6 +21,7 @@
 AI_API_BASE_URL=https://llm.stage.satel.org/v1
 AI_API_KEY=ВАШ_КЛЮЧ_ОСНОВНОЙ_МОДЕЛИ
 AI_MODEL=qwen36-35b
+AI_ENV_PRIORITY=1
 GLOBAL_AI_CONCURRENCY=2
 
 TTS_API_BASE_URL=https://openrouter.ai/api/v1

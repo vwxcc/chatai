@@ -558,11 +558,15 @@ class ModelRouter:
         ]
 
     def _models_for_task(self, db: sqlite3.Connection, task_key: str):
+        env_models = self._environment_models()
+        env_priority = os.getenv("AI_ENV_PRIORITY", "1").strip().lower() in {"1", "true", "yes", "on"}
+        if task_key == "main_generation" and env_priority and env_models:
+            return env_models, 0
+
         row=db.execute("SELECT routing_set_id FROM task_routes WHERE task_key=?",(task_key,)).fetchone()
         if not row or row["routing_set_id"] is None:
-            models = self._environment_models()
-            if models:
-                return models, 0
+            if env_models:
+                return env_models, 0
             raise HTTPException(
                 503,
                 f"Для задачи {task_key} нет маршрута. Настрой AI_API_BASE_URL, AI_API_KEY и AI_MODEL "
@@ -577,10 +581,8 @@ class ModelRouter:
             WHERE rsm.routing_set_id=? AND mc.enabled=1 AND p.enabled=1
             ORDER BY rsm.priority ASC
         """,(row["routing_set_id"],)).fetchall()
-        if not models:
-            models = self._environment_models()
-            if models:
-                return models, 0
+        if not models and env_models:
+            return env_models, 0
         return models,int(row["routing_set_id"])
 
     def _request(self, model, messages):

@@ -94,6 +94,7 @@ if not HOOK_SECRET and BOT_TOKEN:
 dp = Dispatcher()
 bot: Bot | None = None
 polling_task: asyncio.Task | None = None
+webhook_setup_task: asyncio.Task | None = None
 webhook_tasks: set[asyncio.Task] = set()
 ai_lock = asyncio.Semaphore(max(1, int(os.getenv("AI_CONCURRENCY", "2"))))
 
@@ -900,41 +901,74 @@ async def handle_question(message: Message):
             await message.answer(f"Не получилось завершить запрос: {str(exc)[:800]}")
 
 
+async def configure_webhook(bot_instance: Bot) -> None:
+    try:
+        await bot_instance.set_webhook(
+            url=f"{PUBLIC_URL}{HOOK_PATH}",
+            secret_token=HOOK_SECRET,
+            allowed_updates=dp.resolve_used_update_types(),
+            drop_pending_updates=False,
+        )
+        log.info("Webhook registered at %s%s", PUBLIC_URL, HOOK_PATH)
+    except Exception:
+        # Never block Uvicorn startup on Telegram API availability.
+        log.exception("Could not register Telegram webhook. The web port remains available.")
+
+
+async def run_polling(bot_instance: Bot) -> None:
+    try:
+        await bot_instance.delete_webhook(drop_pending_updates=False)
+        log.info("Telegram webhook removed; starting long polling.")
+        await dp.start_polling(bot_instance, close_bot_session=False)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Telegram polling stopped unexpectedly.")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global bot, polling_task
+    global bot, polling_task, webhook_setup_task
+    # Keep startup local and fast; network requests to Telegram run in background tasks.
     await init_db()
+    log.info(
+        "Starting chatai HTTP service on port=%s; webhook=%s; model=%s; TTS model=%s",
+        os.getenv("PORT", "10000"),
+        bool(PUBLIC_URL),
+        AI_MODEL or "(missing)",
+        TTS_MODEL or "(missing)",
+    )
     if not BOT_TOKEN:
-        log.error("TELEGRAM_BOT_TOKEN is missing; bot handlers are disabled.")
+        log.error("TELEGRAM_BOT_TOKEN is missing; Telegram bot handlers are disabled.")
         yield
         return
+
     bot = Bot(token=BOT_TOKEN)
+    if PUBLIC_URL:
+        webhook_setup_task = asyncio.create_task(configure_webhook(bot))
+        log.info("Scheduled Telegram webhook registration.")
+    else:
+        polling_task = asyncio.create_task(run_polling(bot))
+        log.info("Scheduled Telegram polling startup.")
     try:
-        if PUBLIC_URL:
-            await bot.set_webhook(
-                url=f"{PUBLIC_URL}{HOOK_PATH}",
-                secret_token=HOOK_SECRET,
-                allowed_updates=dp.resolve_used_update_types(),
-                drop_pending_updates=False,
-            )
-            log.info("Webhook configured: %s%s", PUBLIC_URL, HOOK_PATH)
-        else:
-            await bot.delete_webhook(drop_pending_updates=False)
-            polling_task = asyncio.create_task(dp.start_polling(bot, close_bot_session=False))
-            log.info("Bot started in polling mode.")
         yield
     finally:
-        if polling_task:
-            polling_task.cancel()
-            try:
-                await polling_task
-            except asyncio.CancelledError:
-                pass
-            polling_task = None
+        for task in (webhook_setup_task, polling_task):
+            if task and not task.done():
+                task.cancel()
+        for task in (webhook_setup_task, polling_task):
+            if task:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    log.exception("Background Telegram setup task failed during shutdown")
+        webhook_setup_task = None
+        polling_task = None
         if bot:
             await bot.session.close()
             bot = None
-
 
 app = FastAPI(title="chatai Telegram bot", version="1.0.0", lifespan=lifespan)
 
@@ -944,9 +978,33 @@ async def root():
     return {"service": "chatai", "status": "ok", "health": "/healthz"}
 
 
+@app.get("/livez")
+async def livez():
+    # Liveness only: verifies that Uvicorn can serve an HTTP request.
+    return {"status": "alive", "port": os.getenv("PORT", "10000")}
+
+
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok", "bot": "configured" if BOT_TOKEN else "token_missing"}
+    checks = {
+        "telegram_token": bool(BOT_TOKEN and bot),
+        "allowed_users": bool(ALLOWED),
+        "ai_api": bool(AI_KEY and AI_BASE and AI_MODEL),
+        "tts_api": bool(TTS_KEY and TTS_BASE and TTS_MODEL),
+    }
+    try:
+        async with db_connect() as db:
+            await db.execute("SELECT 1")
+        checks["database"] = True
+    except Exception as exc:
+        checks["database"] = False
+        log.warning("Readiness database check failed: %s", exc)
+    ready = all(checks.values())
+    return JSONResponse(
+        {"status": "ok" if ready else "not_ready", "checks": checks,
+         "port": os.getenv("PORT", "10000")},
+        status_code=200 if ready else 503,
+    )
 
 
 @app.post(HOOK_PATH)
@@ -981,4 +1039,4 @@ async def telegram_webhook(request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "10000")))

@@ -4,7 +4,7 @@ services:
     runtime: docker
     plan: free
     dockerfilePath: ./Dockerfile
-    healthCheckPath: /healthz
+    healthCheckPath: /livez
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false

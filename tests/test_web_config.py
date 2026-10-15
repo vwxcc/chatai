@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 from contextlib import closing
 
 _TEST_DIR = tempfile.TemporaryDirectory(prefix="ai-ch-tests-")
@@ -26,6 +27,21 @@ class AiChWebsiteTests(unittest.TestCase):
         self.assertEqual(models[0]["base_url"], os.environ["AI_API_BASE_URL"].rstrip("/"))
         self.assertEqual(models[0]["api_key_env"], "AI_API_KEY")
         self.assertEqual(models[0]["model_name"], "test-model")
+
+    def test_environment_model_has_priority_for_main_generation(self):
+        model = {
+            "id": -1, "name": "ENV model", "model_name": "env-primary",
+            "temperature": 0.2, "max_tokens": 100, "timeout": 30,
+            "provider_name": "Environment API", "base_url": "https://api.example/v1",
+            "api_key_env": "AI_API_KEY",
+        }
+        with patch.dict(os.environ, {"AI_ENV_PRIORITY": "1"}):
+            with patch.object(web.MODEL_ROUTER, "_environment_models", return_value=[model]):
+                db = Mock()
+                models, route_id = web.MODEL_ROUTER._models_for_task(db, "main_generation")
+        self.assertEqual(route_id, 0)
+        self.assertEqual(models[0]["model_name"], "env-primary")
+        db.execute.assert_not_called()
 
     def test_concurrency_limit_is_positive(self):
         self.assertGreaterEqual(web.GLOBAL_AI_CONCURRENCY, 1)

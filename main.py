@@ -96,6 +96,7 @@ bot: Bot | None = None
 polling_task: asyncio.Task | None = None
 webhook_setup_task: asyncio.Task | None = None
 webhook_tasks: set[asyncio.Task] = set()
+TELEGRAM_TRANSPORT_READY = False
 ai_lock = asyncio.Semaphore(max(1, int(os.getenv("AI_CONCURRENCY", "2"))))
 
 SYSTEM_PROMPT = r"""
@@ -902,33 +903,49 @@ async def handle_question(message: Message):
 
 
 async def configure_webhook(bot_instance: Bot) -> None:
-    try:
-        await bot_instance.set_webhook(
-            url=f"{PUBLIC_URL}{HOOK_PATH}",
-            secret_token=HOOK_SECRET,
-            allowed_updates=dp.resolve_used_update_types(),
-            drop_pending_updates=False,
-        )
-        log.info("Webhook registered at %s%s", PUBLIC_URL, HOOK_PATH)
-    except Exception:
-        # Never block Uvicorn startup on Telegram API availability.
-        log.exception("Could not register Telegram webhook. The web port remains available.")
+    global TELEGRAM_TRANSPORT_READY
+    for attempt in range(1, 6):
+        try:
+            await bot_instance.set_webhook(
+                url=f"{PUBLIC_URL}{HOOK_PATH}",
+                secret_token=HOOK_SECRET,
+                allowed_updates=dp.resolve_used_update_types(),
+                drop_pending_updates=False,
+            )
+            TELEGRAM_TRANSPORT_READY = True
+            log.info("Webhook registered at %s%s", PUBLIC_URL, HOOK_PATH)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            TELEGRAM_TRANSPORT_READY = False
+            log.exception("Telegram webhook registration attempt %s/5 failed.", attempt)
+            if attempt < 5:
+                await asyncio.sleep(min(2 ** attempt, 30))
+    log.error("Telegram webhook registration failed after 5 attempts.")
 
 
 async def run_polling(bot_instance: Bot) -> None:
-    try:
-        await bot_instance.delete_webhook(drop_pending_updates=False)
-        log.info("Telegram webhook removed; starting long polling.")
-        await dp.start_polling(bot_instance, close_bot_session=False)
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        log.exception("Telegram polling stopped unexpectedly.")
-
+    global TELEGRAM_TRANSPORT_READY
+    for attempt in range(1, 6):
+        try:
+            await bot_instance.delete_webhook(drop_pending_updates=False)
+            TELEGRAM_TRANSPORT_READY = True
+            log.info("Telegram webhook removed; starting long polling.")
+            await dp.start_polling(bot_instance, close_bot_session=False)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            TELEGRAM_TRANSPORT_READY = False
+            log.exception("Telegram polling startup attempt %s/5 failed.", attempt)
+            if attempt < 5:
+                await asyncio.sleep(min(2 ** attempt, 30))
+    log.error("Telegram polling could not start after 5 attempts.")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global bot, polling_task, webhook_setup_task
+    global bot, polling_task, webhook_setup_task, TELEGRAM_TRANSPORT_READY
     # Keep startup local and fast; network requests to Telegram run in background tasks.
     await init_db()
     log.info(
@@ -938,6 +955,7 @@ async def lifespan(app: FastAPI):
         AI_MODEL or "(missing)",
         TTS_MODEL or "(missing)",
     )
+    TELEGRAM_TRANSPORT_READY = False
     if not BOT_TOKEN:
         log.error("TELEGRAM_BOT_TOKEN is missing; Telegram bot handlers are disabled.")
         yield
@@ -987,7 +1005,7 @@ async def livez():
 @app.get("/healthz")
 async def healthz():
     checks = {
-        "telegram_token": bool(BOT_TOKEN and bot),
+        "telegram_transport": bool(BOT_TOKEN and bot and TELEGRAM_TRANSPORT_READY),
         "allowed_users": bool(ALLOWED),
         "ai_api": bool(AI_KEY and AI_BASE and AI_MODEL),
         "tts_api": bool(TTS_KEY and TTS_BASE and TTS_MODEL),

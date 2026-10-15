@@ -5,6 +5,8 @@ import os
 import secrets
 import sqlite3
 import json
+import logging
+import re
 import urllib.request
 import threading
 import time
@@ -61,6 +63,33 @@ MAX_SPREADSHEET_SHEETS = int(os.getenv("MAX_SPREADSHEET_SHEETS", "100"))
 MAX_PRESENTATION_SLIDES = int(os.getenv("MAX_PRESENTATION_SLIDES", "500"))
 AI_CONNECT_TIMEOUT = float(os.getenv("AI_CONNECT_TIMEOUT", "20"))
 AI_SEMAPHORE = threading.BoundedSemaphore(max(1, GLOBAL_AI_CONCURRENCY))
+
+AI_API_BASE_URL = os.getenv("AI_API_BASE_URL", "https://llm.stage.satel.org/v1").strip().rstrip("/")
+AI_API_KEY_ENV = os.getenv("AI_API_KEY_ENV", "AI_API_KEY").strip() or "AI_API_KEY"
+AI_MODEL = os.getenv("AI_MODEL", "qwen36-35b").strip()
+AI_FALLBACK_MODELS = [x.strip() for x in os.getenv("AI_FALLBACK_MODELS", "").split(",") if x.strip()]
+AI_TEMPERATURE = float(os.getenv("AI_TEMPERATURE", "0.2"))
+AI_MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "7000"))
+
+TTS_API_BASE_URL = os.getenv("TTS_API_BASE_URL", "").strip().rstrip("/")
+TTS_API_PATH = os.getenv("TTS_API_PATH", "/audio/speech").strip()
+TTS_API_KEY = os.getenv("TTS_API_KEY", "").strip()
+TTS_MODEL = os.getenv("TTS_MODEL", "").strip()
+TTS_VOICE = os.getenv("TTS_VOICE", "").strip()
+TTS_AUDIO_FORMAT = os.getenv("TTS_AUDIO_FORMAT", "mp3").strip() or "mp3"
+TTS_TIMEOUT = float(os.getenv("TTS_TIMEOUT", "120"))
+TTS_CHUNK_CHARS = max(600, min(int(os.getenv("TTS_CHUNK_CHARS", "2600")), 4000))
+TTS_MAX_CHARS = max(1000, int(os.getenv("TTS_MAX_CHARS", "24000")))
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+ARCHIVE_CHANNEL_ID = os.getenv("ARCHIVE_CHANNEL_ID", "").strip()
+TELEGRAM_TIMEOUT = float(os.getenv("TELEGRAM_TIMEOUT", "25"))
+
+VOLATILE_HISTORY_MESSAGES = max(2, int(os.getenv("VOLATILE_HISTORY_MESSAGES", "12")))
+VOLATILE_HISTORY_CHARS = max(1000, int(os.getenv("VOLATILE_HISTORY_CHARS", "12000")))
+VOLATILE_HISTORY_MAX_SESSIONS = max(1, int(os.getenv("VOLATILE_HISTORY_MAX_SESSIONS", "128")))
+VOLATILE_HISTORY: dict[tuple[int, int], list[dict[str, Any]]] = {}
+VOLATILE_HISTORY_LOCK = threading.RLock()
 AUTH_RATE_WINDOW = int(os.getenv("AUTH_RATE_WINDOW", "900"))
 AUTH_LOGIN_LIMIT = int(os.getenv("AUTH_LOGIN_LIMIT", "10"))
 AUTH_REGISTER_LIMIT = int(os.getenv("AUTH_REGISTER_LIMIT", "5"))
@@ -514,10 +543,30 @@ class TaskRouteRequest(BaseModel):
     routing_set_id: int | None = None
 
 class ModelRouter:
+    def _environment_models(self):
+        if not (AI_API_BASE_URL and AI_MODEL and os.getenv(AI_API_KEY_ENV, "").strip()):
+            return []
+        return [
+            {
+                "id": -index, "name": f"ENV model {model_name}", "model_name": model_name,
+                "temperature": AI_TEMPERATURE, "max_tokens": AI_MAX_TOKENS,
+                "timeout": REQUEST_TIMEOUT, "provider_name": "Environment API",
+                "base_url": AI_API_BASE_URL, "api_key_env": AI_API_KEY_ENV,
+            }
+            for index, model_name in enumerate([AI_MODEL, *AI_FALLBACK_MODELS], 1)
+        ]
+
     def _models_for_task(self, db: sqlite3.Connection, task_key: str):
         row=db.execute("SELECT routing_set_id FROM task_routes WHERE task_key=?",(task_key,)).fetchone()
         if not row or row["routing_set_id"] is None:
-            raise HTTPException(503,f"Для задачи {task_key} не настроен набор моделей")
+            models = self._environment_models()
+            if models:
+                return models, 0
+            raise HTTPException(
+                503,
+                f"Для задачи {task_key} нет маршрута. Настрой AI_API_BASE_URL, AI_API_KEY и AI_MODEL "
+                "или создай набор в AI Router.",
+            )
         models=db.execute("""
             SELECT mc.id,mc.name,mc.model_name,mc.temperature,mc.max_tokens,mc.timeout,
                    p.name AS provider_name,p.base_url,p.api_key_env
@@ -527,6 +576,10 @@ class ModelRouter:
             WHERE rsm.routing_set_id=? AND mc.enabled=1 AND p.enabled=1
             ORDER BY rsm.priority ASC
         """,(row["routing_set_id"],)).fetchall()
+        if not models:
+            models = self._environment_models()
+            if models:
+                return models, 0
         return models,int(row["routing_set_id"])
 
     def _request(self, model, messages):

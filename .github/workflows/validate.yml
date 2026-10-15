@@ -1,0 +1,50 @@
+name: Validate ai-ch website
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install requirements
+        run: pip install -r requirements.txt
+      - name: Compile Python
+        env:
+          SESSION_SECRET: test-session-secret-long-enough-for-session-middleware
+          DATA_DIR: /tmp/ai-ch-ci-data
+          UPLOAD_DIR: /tmp/ai-ch-ci-uploads
+          FRONTEND_DIR: frontend
+          AI_API_BASE_URL: https://api.example/v1
+          AI_API_KEY: test-key
+          AI_MODEL: test-model
+        run: python -m py_compile backend/app.py backend/archive.py
+      - name: Run unit tests
+        env:
+          SESSION_SECRET: test-session-secret-long-enough-for-session-middleware
+          DATA_DIR: /tmp/ai-ch-ci-data
+          UPLOAD_DIR: /tmp/ai-ch-ci-uploads
+          FRONTEND_DIR: frontend
+          AI_API_BASE_URL: https://api.example/v1
+          AI_API_KEY: test-key
+          AI_MODEL: test-model
+        run: python -m unittest discover -s tests -v
+      - name: Build Docker image
+        run: docker build -t ai-ch:ci .
+      - name: Smoke-test HTTP binding
+        run: |
+          docker run -d --name ai-ch-test -p 10000:10000 \
+            -e SESSION_SECRET=test-session-secret-long-enough-for-session-middleware \
+            -e AI_API_BASE_URL=https://api.example/v1 -e AI_API_KEY=test -e AI_MODEL=test \
+            ai-ch:ci
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:10000/api/health >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:10000/api/health
+          docker rm -f ai-ch-test

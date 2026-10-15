@@ -4,6 +4,12 @@ import main
 
 
 class APIAdapterTests(unittest.TestCase):
+    def test_liveness_endpoint_is_independent_of_api_keys(self):
+        import asyncio
+        result = asyncio.run(main.livez())
+        self.assertEqual(result["status"], "alive")
+        self.assertEqual(result["port"], __import__("os").getenv("PORT", "10000"))
+
     def test_endpoint_joins_base_and_path(self):
         self.assertEqual(
             main._endpoint("https://api.example/v1", "/chat/completions"),

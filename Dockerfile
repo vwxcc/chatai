@@ -15,7 +15,6 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install -r /app/requirements.txt
 
 COPY main.py /app/main.py
-COPY tests /app/tests
 RUN mkdir -p /app/data
 
 # Render forwards external HTTP traffic to the port configured in PORT.

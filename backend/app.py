@@ -18,6 +18,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from backend import archive as telegram_archive
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
@@ -945,6 +946,7 @@ async def same_origin_api_middleware(request: Request, call_next):
 app.add_middleware(SessionMiddleware,secret_key=SESSION_SECRET,session_cookie="chatstudio_session",same_site="lax",https_only=SESSION_COOKIE_SECURE,max_age=60*60*24*30)
 app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=False,allow_methods=["*"],allow_headers=["*"])
 init_db()
+_purge_persisted_content_on_startup()
 
 # A queued request is never actively processed by another task: generation starts
 # synchronously in the same HTTP request. If the process restarts after creating
@@ -958,8 +960,18 @@ with closing(get_db()) as _startup_db:
     _startup_db.commit()
 
 @app.get("/api/health")
+@app.get("/healthz")
 def health():
-    return {"status":"ok"}
+    return {
+        "status": "alive",
+        "concurrency_limit": GLOBAL_AI_CONCURRENCY,
+        "conversation_storage": "transient",
+        "checks": {
+            "environment_ai": bool(AI_API_BASE_URL and AI_MODEL and os.getenv(AI_API_KEY_ENV, "").strip()),
+            "telegram_archive": bool(telegram_archive.BOT_TOKEN and telegram_archive.CHANNEL_ID),
+            "tts_audio_archive": bool(telegram_archive.TTS_BASE and telegram_archive.TTS_KEY and telegram_archive.TTS_MODEL),
+        },
+    }
 
 @app.post("/api/auth/register")
 def register(payload:RegisterRequest,request:Request):
@@ -1034,10 +1046,23 @@ def create_chat(payload:CreateChatRequest,request:Request):
     user=current_user(request)
     title=payload.title.strip() or "Новый чат"
     ts=now_iso()
+    user_id=int(user["id"])
     with closing(get_db()) as db:
-        cur=db.execute("INSERT INTO chats(user_id,title,created_at,updated_at) VALUES(?,?,?,?)",(user["id"],title,ts,ts))
+        existing=db.execute("SELECT id FROM chats WHERE user_id=? ORDER BY updated_at DESC,id DESC LIMIT 1",(user_id,)).fetchone()
+        if existing:
+            chat_id=int(existing["id"])
+            db.execute("DELETE FROM messages WHERE chat_id=?",(chat_id,))
+            db.execute("DELETE FROM chat_suggestions WHERE chat_id=?",(chat_id,))
+            db.execute("DELETE FROM chat_shares WHERE chat_id=?",(chat_id,))
+            db.execute("DELETE FROM ai_requests WHERE chat_id=?",(chat_id,))
+            db.execute("UPDATE chats SET title=?,archived=0,created_at=?,updated_at=? WHERE id=? AND user_id=?",(title,ts,ts,chat_id,user_id))
+        else:
+            cur=db.execute("INSERT INTO chats(user_id,title,created_at,updated_at) VALUES(?,?,?,?)",(user_id,title,ts,ts))
+            chat_id=int(cur.lastrowid)
         db.commit()
-        chat=get_owned_chat(db,int(cur.lastrowid),int(user["id"]))
+        chat=get_owned_chat(db,chat_id,user_id)
+    with VOLATILE_HISTORY_LOCK:
+        VOLATILE_HISTORY.pop((user_id,chat_id),None)
     return {"chat":dict(chat)}
 
 @app.get("/api/chats/{chat_id}")
@@ -1240,7 +1265,7 @@ def create_request(payload:MessageRequest,request:Request,background_tasks:Backg
     except RuntimeError:
         raise HTTPException(409,"Запрос уже остановлен")
     with closing(get_db()) as db:
-        ai_messages=_chat_ai_messages(db,payload.chat_id)
+        ai_messages=_with_volatile_history(int(user['id']),payload.chat_id,_chat_ai_messages(db,payload.chat_id))
     try:
         result=MODEL_ROUTER.generate("main_generation",ai_messages,cancel_check=lambda: is_ai_request_cancelled(request_id),request_id=request_id)
     except HTTPException as exc:

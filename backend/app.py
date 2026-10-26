@@ -273,6 +273,8 @@ def init_db() -> None:
             endpoint TEXT,
             streaming INTEGER NOT NULL DEFAULT 0,
             attempt_status TEXT NOT NULL CHECK(attempt_status IN ('success','failed','cancelled')),
+            error_kind TEXT,
+            http_status INTEGER,
             usage_status TEXT NOT NULL CHECK(usage_status IN ('available','missing','parse_error','incomplete')),
             cache_status TEXT NOT NULL CHECK(cache_status IN ('available','missing','parse_error','incomplete')),
             prompt_tokens INTEGER,
@@ -304,6 +306,10 @@ def init_db() -> None:
         usage_columns = {row["name"] for row in db.execute("PRAGMA table_info(ai_usage_events)").fetchall()}
         if "cache_status" not in usage_columns:
             db.execute("ALTER TABLE ai_usage_events ADD COLUMN cache_status TEXT NOT NULL DEFAULT 'missing'")
+        if "error_kind" not in usage_columns:
+            db.execute("ALTER TABLE ai_usage_events ADD COLUMN error_kind TEXT")
+        if "http_status" not in usage_columns:
+            db.execute("ALTER TABLE ai_usage_events ADD COLUMN http_status INTEGER")
         db.commit()
 
 def hash_password(password: str) -> str:
@@ -754,6 +760,7 @@ class ModelRouter:
                             usage=usage_payload,
                             attempt_status="cancelled",
                             usage_status=usage_status,
+                            error_kind="client_disconnect",
                             duration_ms=int((time_monotonic()-started)*1000),
                         )
                     raise
@@ -771,6 +778,8 @@ class ModelRouter:
                             usage=usage_payload,
                             attempt_status=attempt_status,
                             usage_status=usage_status,
+                            error_kind=_ai_error_kind(exc),
+                            http_status=getattr(exc, "code", None),
                             duration_ms=int((time_monotonic()-started)*1000),
                         )
                         usage_recorded=True
@@ -836,6 +845,8 @@ class ModelRouter:
                             usage=response_data.get("usage") if isinstance(response_data,dict) else None,
                             attempt_status=attempt_status,
                             usage_status=usage_status,
+                            error_kind=_ai_error_kind(exc),
+                            http_status=getattr(exc, "code", None),
                             duration_ms=int((time_monotonic()-started)*1000),
                         )
                         usage_recorded=True
@@ -926,6 +937,22 @@ def _safe_endpoint(base_url):
         return None
 
 
+def _ai_error_kind(exc):
+    if str(exc) == "REQUEST_CANCELLED":
+        return "cancelled"
+    if str(exc) == "AI_RESPONSE_PARSE_ERROR":
+        return "response_parse_error"
+    status = getattr(exc, "code", None)
+    if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
+        return "http_" + str(status)
+    reason = getattr(exc, "reason", None)
+    if isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError):
+        return "timeout"
+    if str(exc) in {"Провайдер вернул пустой ответ", "Провайдер вернул пустой поток"}:
+        return "empty_response"
+    return type(exc).__name__[:80]
+
+
 def _record_ai_usage_event(
     *,
     request_id,
@@ -937,6 +964,8 @@ def _record_ai_usage_event(
     usage=None,
     attempt_status="success",
     usage_status=None,
+    error_kind=None,
+    http_status=None,
     duration_ms=None,
 ):
     try:
@@ -954,16 +983,18 @@ def _record_ai_usage_event(
         if status == "cancelled" and metrics["usage_status"] == "missing" and usage_status is None:
             metrics["usage_status"] = "incomplete"
         duration = None if duration_ms is None else max(0, int(duration_ms))
+        status_code = http_status if isinstance(http_status, int) and not isinstance(http_status, bool) and 100 <= http_status <= 599 else None
+        safe_error_kind = str(error_kind)[:80] if error_kind else None
         created_at = now_iso()
         with closing(get_db()) as db:
             db.execute(
                 """
                 INSERT INTO ai_usage_events (
                     request_id, task_key, routing_set_id, provider, model, response_model,
-                    endpoint, streaming, attempt_status, usage_status, cache_status, prompt_tokens,
-                    completion_tokens, total_tokens, cache_hit_tokens, cache_miss_tokens,
-                    cache_hit_rate, duration_ms, created_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    endpoint, streaming, attempt_status, error_kind, http_status, usage_status,
+                    cache_status, prompt_tokens, completion_tokens, total_tokens, cache_hit_tokens,
+                    cache_miss_tokens, cache_hit_rate, duration_ms, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     int(request_id) if request_id is not None else None,
@@ -975,6 +1006,8 @@ def _record_ai_usage_event(
                     endpoint,
                     int(bool(streaming)),
                     status,
+                    safe_error_kind,
+                    status_code,
                     metrics["usage_status"],
                     metrics["cache_status"],
                     metrics["prompt_tokens"],
@@ -1955,21 +1988,21 @@ def list_ai_usage(request:Request,limit:int=100):
         events=db.execute(
             """
             SELECT id,request_id,task_key,routing_set_id,provider,model,response_model,endpoint,
-                   streaming,attempt_status,usage_status,cache_status,prompt_tokens,completion_tokens,total_tokens,
-                   cache_hit_tokens,cache_miss_tokens,cache_hit_rate,duration_ms,created_at
+                   streaming,attempt_status,error_kind,http_status,usage_status,cache_status,prompt_tokens,
+                   completion_tokens,total_tokens,cache_hit_tokens,cache_miss_tokens,cache_hit_rate,duration_ms,created_at
             FROM ai_usage_events ORDER BY id DESC LIMIT ?
             """,
             (limit,)
         ).fetchall()
         summary=db.execute(
             """
-            SELECT task_key,provider,model,streaming,attempt_status,usage_status,cache_status,
+            SELECT task_key,provider,model,streaming,attempt_status,error_kind,http_status,usage_status,cache_status,
                    COUNT(*) AS attempts,SUM(prompt_tokens) AS prompt_tokens,
                    SUM(completion_tokens) AS completion_tokens,SUM(total_tokens) AS total_tokens,
                    SUM(cache_hit_tokens) AS cache_hit_tokens,SUM(cache_miss_tokens) AS cache_miss_tokens,
                    SUM(CASE WHEN prompt_tokens>0 AND cache_hit_tokens IS NOT NULL THEN 1 ELSE 0 END) AS cache_rate_samples
             FROM ai_usage_events
-            GROUP BY task_key,provider,model,streaming,attempt_status,usage_status,cache_status
+            GROUP BY task_key,provider,model,streaming,attempt_status,error_kind,http_status,usage_status,cache_status
             ORDER BY attempts DESC,task_key,provider,model
             """
         ).fetchall()

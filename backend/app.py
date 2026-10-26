@@ -15,7 +15,8 @@ import mimetypes
 import io
 import zipfile
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any
 from backend import archive as telegram_archive
@@ -71,6 +72,7 @@ AI_MODEL = os.getenv("AI_MODEL", "qwen36-35b").strip()
 AI_FALLBACK_MODELS = [x.strip() for x in os.getenv("AI_FALLBACK_MODELS", "").split(",") if x.strip()]
 AI_TEMPERATURE = float(os.getenv("AI_TEMPERATURE", "0.2"))
 AI_MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "7000"))
+AI_USAGE_RETENTION_DAYS = max(1, int(os.getenv("AI_USAGE_RETENTION_DAYS", "30")))
 
 TTS_API_BASE_URL = os.getenv("TTS_API_BASE_URL", "").strip().rstrip("/")
 TTS_API_PATH = os.getenv("TTS_API_PATH", "/audio/speech").strip()
@@ -260,6 +262,32 @@ def init_db() -> None:
             FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE,
             FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE SET NULL
         );
+        CREATE TABLE IF NOT EXISTS ai_usage_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id INTEGER,
+            task_key TEXT NOT NULL,
+            routing_set_id INTEGER,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            response_model TEXT,
+            endpoint TEXT,
+            streaming INTEGER NOT NULL DEFAULT 0,
+            attempt_status TEXT NOT NULL CHECK(attempt_status IN ('success','failed','cancelled')),
+            error_kind TEXT,
+            http_status INTEGER,
+            usage_status TEXT NOT NULL CHECK(usage_status IN ('available','missing','parse_error','incomplete')),
+            cache_status TEXT NOT NULL CHECK(cache_status IN ('available','missing','parse_error','incomplete')),
+            prompt_tokens INTEGER,
+            completion_tokens INTEGER,
+            total_tokens INTEGER,
+            cache_hit_tokens INTEGER,
+            cache_miss_tokens INTEGER,
+            cache_hit_rate REAL,
+            duration_ms INTEGER,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_usage_created ON ai_usage_events(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_ai_usage_route_model ON ai_usage_events(task_key,provider,model,created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_chats_user_updated ON chats(user_id,updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_messages_chat_created ON messages(chat_id,created_at);
         CREATE INDEX IF NOT EXISTS idx_files_user_created ON files(user_id,created_at DESC);
@@ -275,6 +303,13 @@ def init_db() -> None:
         columns = {row["name"] for row in db.execute("PRAGMA table_info(ai_requests)").fetchall()}
         if "cancel_requested" not in columns:
             db.execute("ALTER TABLE ai_requests ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
+        usage_columns = {row["name"] for row in db.execute("PRAGMA table_info(ai_usage_events)").fetchall()}
+        if "cache_status" not in usage_columns:
+            db.execute("ALTER TABLE ai_usage_events ADD COLUMN cache_status TEXT NOT NULL DEFAULT 'missing'")
+        if "error_kind" not in usage_columns:
+            db.execute("ALTER TABLE ai_usage_events ADD COLUMN error_kind TEXT")
+        if "http_status" not in usage_columns:
+            db.execute("ALTER TABLE ai_usage_events ADD COLUMN http_status INTEGER")
         db.commit()
 
 def hash_password(password: str) -> str:
@@ -599,11 +634,21 @@ class ModelRouter:
         url=model["base_url"].rstrip("/")+"/chat/completions"
         req=urllib.request.Request(url,data=json.dumps(payload).encode("utf-8"),headers=headers,method="POST")
         with urllib.request.urlopen(req,timeout=max(AI_CONNECT_TIMEOUT, timeout)) as response:
-            data=json.loads(response.read().decode("utf-8"))
-        content=data.get("choices",[{}])[0].get("message",{}).get("content")
-        if not isinstance(content,str) or not content.strip():
-            raise RuntimeError("Провайдер вернул пустой ответ")
-        return content
+            try:
+                data=json.loads(response.read().decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("AI_RESPONSE_PARSE_ERROR") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError("AI_RESPONSE_PARSE_ERROR")
+        choices=data.get("choices")
+        choice=choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+        message=choice.get("message") if isinstance(choice.get("message"), dict) else {}
+        content=message.get("content")
+        return {
+            "content": content if isinstance(content, str) else "",
+            "usage": data.get("usage"),
+            "response_model": data.get("model"),
+        }
 
     def stream_generate(self, task_key: str, messages, cancel_check=None, request_id=None):
         with closing(get_db()) as db:
@@ -616,12 +661,20 @@ class ModelRouter:
                 if cancel_check and cancel_check():
                     raise RuntimeError("REQUEST_CANCELLED")
                 started=time_monotonic()
+                usage_payload=None
+                response_model=None
+                usage_recorded=False
+                saw_content=False
+                saw_done=False
+                malformed_event=False
                 try:
                     api_key=os.getenv(model["api_key_env"]) if model["api_key_env"] else None
                     headers={"Content-Type":"application/json","Accept":"text/event-stream"}
                     if api_key:
                         headers["Authorization"]="Bearer "+api_key
                     payload={"model":model["model_name"],"messages":messages,"stream":True}
+                    if os.getenv("AI_STREAM_INCLUDE_USAGE","1").strip().lower() in {"1","true","yes","on"}:
+                        payload["stream_options"]={"include_usage":True}
                     if model["temperature"] is not None:
                         payload["temperature"]=model["temperature"]
                     if model["max_tokens"] is not None:
@@ -631,7 +684,6 @@ class ModelRouter:
                     req=urllib.request.Request(url,data=json.dumps(payload).encode("utf-8"),headers=headers,method="POST")
                     response=urllib.request.urlopen(req,timeout=max(AI_CONNECT_TIMEOUT,timeout))
                     try:
-                        saw_content=False
                         for raw_line in response:
                             if cancel_check and cancel_check():
                                 raise RuntimeError("REQUEST_CANCELLED")
@@ -640,25 +692,97 @@ class ModelRouter:
                                 continue
                             data_text=line[5:].strip()
                             if data_text == "[DONE]":
+                                saw_done=True
                                 break
                             try:
                                 data=json.loads(data_text)
                             except json.JSONDecodeError:
+                                malformed_event=True
                                 continue
-                            delta=data.get("choices",[{}])[0].get("delta",{}).get("content")
-                            if isinstance(delta,str) and delta:
+                            if not isinstance(data, dict):
+                                malformed_event=True
+                                continue
+                            if isinstance(data.get("model"), str):
+                                response_model=data["model"]
+                            candidate_usage=data.get("usage")
+                            if candidate_usage is not None:
+                                usage_payload=candidate_usage
+                            choices=data.get("choices")
+                            # include_usage may produce a final chunk with choices=[].
+                            if not isinstance(choices, list) or not choices:
+                                continue
+                            choice=choices[0]
+                            if not isinstance(choice, dict):
+                                continue
+                            delta=choice.get("delta")
+                            if not isinstance(delta, dict):
+                                continue
+                            text_delta=delta.get("content")
+                            if isinstance(text_delta,str) and text_delta:
                                 saw_content=True
-                                yield {"type":"delta","content":delta}
+                                yield {"type":"delta","content":text_delta}
                         if cancel_check and cancel_check():
                             raise RuntimeError("REQUEST_CANCELLED")
                         if not saw_content:
                             raise RuntimeError("Провайдер вернул пустой поток")
                     finally:
                         response.close()
+
+                    usage_status = None
+                    if usage_payload is None:
+                        usage_status = "parse_error" if malformed_event else ("missing" if saw_done else "incomplete")
+                    _record_ai_usage_event(
+                        request_id=request_id,
+                        task_key=task_key,
+                        routing_set_id=routing_set_id,
+                        model=model,
+                        response_model=response_model,
+                        streaming=True,
+                        usage=usage_payload,
+                        attempt_status="success",
+                        usage_status=usage_status,
+                        duration_ms=int((time_monotonic()-started)*1000),
+                    )
+                    usage_recorded=True
                     attempts.append({"provider":model["provider_name"],"model":model["model_name"],"status":"success","duration_ms":int((time_monotonic()-started)*1000)})
                     yield {"type":"done","model":model["model_name"],"provider":model["provider_name"],"routing_set_id":routing_set_id,"fallback_attempts":attempts}
                     return
+                except GeneratorExit:
+                    if not usage_recorded:
+                        usage_status = None if usage_payload is not None else ("parse_error" if malformed_event else "incomplete")
+                        _record_ai_usage_event(
+                            request_id=request_id,
+                            task_key=task_key,
+                            routing_set_id=routing_set_id,
+                            model=model,
+                            response_model=response_model,
+                            streaming=True,
+                            usage=usage_payload,
+                            attempt_status="cancelled",
+                            usage_status=usage_status,
+                            error_kind="client_disconnect",
+                            duration_ms=int((time_monotonic()-started)*1000),
+                        )
+                    raise
                 except Exception as exc:
+                    attempt_status="cancelled" if str(exc)=="REQUEST_CANCELLED" else "failed"
+                    if not usage_recorded:
+                        usage_status = None if usage_payload is not None else ("parse_error" if malformed_event else ("missing" if saw_done else "incomplete"))
+                        _record_ai_usage_event(
+                            request_id=request_id,
+                            task_key=task_key,
+                            routing_set_id=routing_set_id,
+                            model=model,
+                            response_model=response_model,
+                            streaming=True,
+                            usage=usage_payload,
+                            attempt_status=attempt_status,
+                            usage_status=usage_status,
+                            error_kind=_ai_error_kind(exc),
+                            http_status=getattr(exc, "code", None),
+                            duration_ms=int((time_monotonic()-started)*1000),
+                        )
+                        usage_recorded=True
                     attempts.append({"provider":model["provider_name"],"model":model["model_name"],"status":"failed","error":str(exc)[:500],"duration_ms":int((time_monotonic()-started)*1000)})
                     if request_id:
                         update_ai_request(request_id,fallback_attempts_json=json.dumps(attempts,ensure_ascii=False))
@@ -679,13 +803,53 @@ class ModelRouter:
                 if cancel_check and cancel_check():
                     raise RuntimeError("REQUEST_CANCELLED")
                 started=time_monotonic()
+                response_data=None
+                usage_recorded=False
                 try:
-                    content=self._request(model,messages)
+                    response_data=self._request(model,messages)
+                    content=response_data.get("content")
                     if cancel_check and cancel_check():
                         raise RuntimeError("REQUEST_CANCELLED")
+                    if not isinstance(content,str) or not content.strip():
+                        raise RuntimeError("Провайдер вернул пустой ответ")
+                    _record_ai_usage_event(
+                        request_id=request_id,
+                        task_key=task_key,
+                        routing_set_id=routing_set_id,
+                        model=model,
+                        response_model=response_data.get("response_model"),
+                        streaming=False,
+                        usage=response_data.get("usage"),
+                        attempt_status="success",
+                        duration_ms=int((time_monotonic()-started)*1000),
+                    )
+                    usage_recorded=True
                     attempts.append({"provider":model["provider_name"],"model":model["model_name"],"status":"success","duration_ms":int((time_monotonic()-started)*1000)})
                     return {"content":content,"model":model["model_name"],"provider":model["provider_name"],"routing_set_id":routing_set_id,"fallback_attempts":attempts}
                 except Exception as exc:
+                    attempt_status="cancelled" if str(exc)=="REQUEST_CANCELLED" else "failed"
+                    if not usage_recorded:
+                        if str(exc)=="AI_RESPONSE_PARSE_ERROR":
+                            usage_status="parse_error"
+                        elif response_data is not None:
+                            usage_status="missing"
+                        else:
+                            usage_status="incomplete"
+                        _record_ai_usage_event(
+                            request_id=request_id,
+                            task_key=task_key,
+                            routing_set_id=routing_set_id,
+                            model=model,
+                            response_model=response_data.get("response_model") if isinstance(response_data,dict) else None,
+                            streaming=False,
+                            usage=response_data.get("usage") if isinstance(response_data,dict) else None,
+                            attempt_status=attempt_status,
+                            usage_status=usage_status,
+                            error_kind=_ai_error_kind(exc),
+                            http_status=getattr(exc, "code", None),
+                            duration_ms=int((time_monotonic()-started)*1000),
+                        )
+                        usage_recorded=True
                     attempts.append({"provider":model["provider_name"],"model":model["model_name"],"status":"failed","error":str(exc)[:500],"duration_ms":int((time_monotonic()-started)*1000)})
                     if request_id:
                         update_ai_request(request_id,fallback_attempts_json=json.dumps(attempts,ensure_ascii=False))
@@ -695,6 +859,174 @@ class ModelRouter:
 
 def time_monotonic():
     return time.monotonic()
+
+
+def _usage_nonnegative_int(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value >= 0:
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _normalise_ai_usage(usage):
+    empty = {
+        "usage_status": "missing",
+        "cache_status": "missing",
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+        "cache_hit_tokens": None,
+        "cache_miss_tokens": None,
+        "cache_hit_rate": None,
+    }
+    if usage is None:
+        return empty
+    if not isinstance(usage, dict):
+        return {**empty, "usage_status": "parse_error", "cache_status": "parse_error"}
+
+    prompt = _usage_nonnegative_int(usage.get("prompt_tokens"))
+    completion = _usage_nonnegative_int(usage.get("completion_tokens"))
+    total = _usage_nonnegative_int(usage.get("total_tokens"))
+    hit = _usage_nonnegative_int(usage.get("prompt_cache_hit_tokens"))
+    if hit is None and usage.get("prompt_cache_hit_tokens") is None:
+        details = usage.get("prompt_tokens_details")
+        if isinstance(details, dict):
+            hit = _usage_nonnegative_int(details.get("cached_tokens"))
+    miss = _usage_nonnegative_int(usage.get("prompt_cache_miss_tokens"))
+
+    recognized = (
+        prompt, completion, total,
+        hit, miss,
+    )
+    status = "available" if any(value is not None for value in recognized) else "incomplete"
+    cache_status = "available" if hit is not None or miss is not None else "missing"
+    hit_rate = (hit / prompt * 100.0) if prompt is not None and prompt > 0 and hit is not None else None
+    return {
+        "usage_status": status,
+        "cache_status": cache_status,
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total,
+        "cache_hit_tokens": hit,
+        "cache_miss_tokens": miss,
+        "cache_hit_rate": hit_rate,
+    }
+
+
+def _safe_endpoint(base_url):
+    try:
+        parsed = urlsplit(str(base_url or "").strip())
+        scheme = (parsed.scheme or "").lower()
+        host = parsed.hostname
+        if scheme not in {"http", "https"} or not host:
+            return None
+        host = host.lower()
+        if ":" in host and not host.startswith("["):
+            host = "[" + host + "]"
+        try:
+            port = parsed.port
+        except ValueError:
+            return None
+        authority = host + ((":" + str(port)) if port is not None else "")
+        # Deliberately omit credentials, paths and query strings from telemetry.
+        return scheme + "://" + authority
+    except Exception:
+        return None
+
+
+def _ai_error_kind(exc):
+    if str(exc) == "REQUEST_CANCELLED":
+        return "cancelled"
+    if str(exc) == "AI_RESPONSE_PARSE_ERROR":
+        return "response_parse_error"
+    status = getattr(exc, "code", None)
+    if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
+        return "http_" + str(status)
+    reason = getattr(exc, "reason", None)
+    if isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError):
+        return "timeout"
+    if str(exc) in {"Провайдер вернул пустой ответ", "Провайдер вернул пустой поток"}:
+        return "empty_response"
+    return type(exc).__name__[:80]
+
+
+def _record_ai_usage_event(
+    *,
+    request_id,
+    task_key,
+    routing_set_id,
+    model,
+    response_model=None,
+    streaming=False,
+    usage=None,
+    attempt_status="success",
+    usage_status=None,
+    error_kind=None,
+    http_status=None,
+    duration_ms=None,
+):
+    try:
+        model_data = dict(model)
+        metrics = _normalise_ai_usage(usage)
+        if metrics["usage_status"] != "available" and usage_status:
+            metrics["usage_status"] = usage_status
+        if metrics["cache_status"] != "available" and usage_status:
+            metrics["cache_status"] = usage_status
+        provider = str(model_data.get("provider_name") or "unknown")[:200]
+        model_name = str(model_data.get("model_name") or "unknown")[:200]
+        response_model_name = str(response_model)[:200] if response_model else None
+        endpoint = _safe_endpoint(model_data.get("base_url"))
+        status = attempt_status if attempt_status in {"success", "failed", "cancelled"} else "failed"
+        if status == "cancelled" and metrics["usage_status"] == "missing" and usage_status is None:
+            metrics["usage_status"] = "incomplete"
+        duration = None if duration_ms is None else max(0, int(duration_ms))
+        status_code = http_status if isinstance(http_status, int) and not isinstance(http_status, bool) and 100 <= http_status <= 599 else None
+        safe_error_kind = str(error_kind)[:80] if error_kind else None
+        created_at = now_iso()
+        with closing(get_db()) as db:
+            db.execute(
+                """
+                INSERT INTO ai_usage_events (
+                    request_id, task_key, routing_set_id, provider, model, response_model,
+                    endpoint, streaming, attempt_status, error_kind, http_status, usage_status,
+                    cache_status, prompt_tokens, completion_tokens, total_tokens, cache_hit_tokens,
+                    cache_miss_tokens, cache_hit_rate, duration_ms, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    int(request_id) if request_id is not None else None,
+                    str(task_key or "unknown")[:100],
+                    int(routing_set_id) if routing_set_id is not None else None,
+                    provider,
+                    model_name,
+                    response_model_name,
+                    endpoint,
+                    int(bool(streaming)),
+                    status,
+                    safe_error_kind,
+                    status_code,
+                    metrics["usage_status"],
+                    metrics["cache_status"],
+                    metrics["prompt_tokens"],
+                    metrics["completion_tokens"],
+                    metrics["total_tokens"],
+                    metrics["cache_hit_tokens"],
+                    metrics["cache_miss_tokens"],
+                    metrics["cache_hit_rate"],
+                    duration,
+                    created_at,
+                ),
+            )
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=AI_USAGE_RETENTION_DAYS)).isoformat()
+            db.execute("DELETE FROM ai_usage_events WHERE created_at < ?", (cutoff,))
+            db.commit()
+    except Exception as exc:
+        # Telemetry must never break or force a retry of a valid model response.
+        logging.warning("AI usage telemetry persistence failed (%s)", type(exc).__name__)
+
 
 def create_ai_request(user_id:int,chat_id:int,task_key:str,message_id=None):
     ts=now_iso()
@@ -1647,6 +1979,35 @@ def list_chat_requests(chat_id:int,request:Request):
 def routing_access(request:Request):
     user=current_user(request)
     return {"is_admin": bool(ADMIN_EMAILS and str(user["email"]).lower() in ADMIN_EMAILS)}
+
+@app.get("/api/routing/usage")
+def list_ai_usage(request:Request,limit:int=100):
+    require_admin(request)
+    limit=max(1,min(int(limit),500))
+    with closing(get_db()) as db:
+        events=db.execute(
+            """
+            SELECT id,request_id,task_key,routing_set_id,provider,model,response_model,endpoint,
+                   streaming,attempt_status,error_kind,http_status,usage_status,cache_status,prompt_tokens,
+                   completion_tokens,total_tokens,cache_hit_tokens,cache_miss_tokens,cache_hit_rate,duration_ms,created_at
+            FROM ai_usage_events ORDER BY id DESC LIMIT ?
+            """,
+            (limit,)
+        ).fetchall()
+        summary=db.execute(
+            """
+            SELECT task_key,provider,model,streaming,attempt_status,error_kind,http_status,usage_status,cache_status,
+                   COUNT(*) AS attempts,SUM(prompt_tokens) AS prompt_tokens,
+                   SUM(completion_tokens) AS completion_tokens,SUM(total_tokens) AS total_tokens,
+                   SUM(cache_hit_tokens) AS cache_hit_tokens,SUM(cache_miss_tokens) AS cache_miss_tokens,
+                   SUM(CASE WHEN prompt_tokens>0 AND cache_hit_tokens IS NOT NULL THEN 1 ELSE 0 END) AS cache_rate_samples
+            FROM ai_usage_events
+            GROUP BY task_key,provider,model,streaming,attempt_status,error_kind,http_status,usage_status,cache_status
+            ORDER BY attempts DESC,task_key,provider,model
+            """
+        ).fetchall()
+    return {"events":[dict(row) for row in events],"summary":[dict(row) for row in summary],"retention_days":AI_USAGE_RETENTION_DAYS}
+
 
 @app.get("/api/routing/providers")
 def list_providers(request:Request):

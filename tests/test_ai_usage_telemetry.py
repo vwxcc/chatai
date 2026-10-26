@@ -1,8 +1,10 @@
+import json
 import os
 import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 _TEST_ROOT = tempfile.TemporaryDirectory(prefix="ai-ch-usage-tests-")
 os.environ["SESSION_SECRET"] = "test-only-session-secret-with-more-than-32-chars"
@@ -10,12 +12,14 @@ os.environ["DATA_DIR"] = str(Path(_TEST_ROOT.name) / "data")
 os.environ["UPLOAD_DIR"] = str(Path(_TEST_ROOT.name) / "uploads")
 os.environ["FRONTEND_DIR"] = str(Path(_TEST_ROOT.name) / "frontend")
 os.environ["AI_USAGE_RETENTION_DAYS"] = "30"
+os.environ["AI_STREAM_INCLUDE_USAGE"] = "1"
 
 from backend.app import (  # noqa: E402
     _normalise_ai_usage,
     _record_ai_usage_event,
     _safe_endpoint,
     get_db,
+    ModelRouter,
 )
 
 
@@ -106,6 +110,88 @@ class UsageNormalisationTests(unittest.TestCase):
         self.assertEqual(row["endpoint"], "https://example.test")
         self.assertNotIn("secret", str(dict(row)))
         self.assertTrue({"messages", "content", "api_key", "prompt"}.isdisjoint(set(row.keys())))
+
+
+class _FakeSSEStream:
+    def __init__(self, chunks):
+        self.chunks = chunks
+        self.closed = False
+
+    def __iter__(self):
+        return iter(self.chunks)
+
+    def close(self):
+        self.closed = True
+
+
+class StreamingUsageTests(unittest.TestCase):
+    def setUp(self):
+        with closing(get_db()) as db:
+            db.execute("DELETE FROM ai_usage_events")
+            db.commit()
+
+    @staticmethod
+    def _model():
+        return {
+            "id": 1,
+            "name": "Test model",
+            "model_name": "test-stream-model",
+            "temperature": 0.2,
+            "max_tokens": 100,
+            "timeout": 5,
+            "provider_name": "Test Provider",
+            "base_url": "https://api.example.test/v1",
+            "api_key_env": None,
+        }
+
+    def test_stream_usage_only_chunk_is_read_without_fallback(self):
+        response = _FakeSSEStream([
+            b'data: {"model":"test-stream-model","choices":[{"delta":{"content":"hello"}}]}\\n',
+            b'data: {"model":"test-stream-model","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":1,"total_tokens":11,"prompt_cache_hit_tokens":6,"prompt_cache_miss_tokens":4}}\\n',
+            b"data: [DONE]\\n",
+        ])
+        router = ModelRouter()
+        with patch.object(router, "_models_for_task", return_value=([self._model()], 3)):
+            with patch("backend.app.urllib.request.urlopen", return_value=response) as urlopen:
+                events = list(router.stream_generate(
+                    "main_generation",
+                    [{"role": "user", "content": "test"}],
+                    request_id=321,
+                ))
+        self.assertEqual([item["type"] for item in events], ["delta", "done"])
+        self.assertTrue(response.closed)
+        payload = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual(payload["stream_options"], {"include_usage": True})
+        with closing(get_db()) as db:
+            row = db.execute("SELECT * FROM ai_usage_events WHERE request_id=321").fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["attempt_status"], "success")
+        self.assertEqual(row["usage_status"], "available")
+        self.assertEqual(row["cache_status"], "available")
+        self.assertEqual(row["cache_hit_tokens"], 6)
+        self.assertEqual(row["cache_miss_tokens"], 4)
+        self.assertEqual(row["response_model"], "test-stream-model")
+
+    def test_stream_ending_before_final_usage_is_marked_incomplete(self):
+        response = _FakeSSEStream([
+            b'data: {"model":"test-stream-model","choices":[{"delta":{"content":"partial"}}]}\\n',
+        ])
+        router = ModelRouter()
+        with patch.object(router, "_models_for_task", return_value=([self._model()], 3)):
+            with patch("backend.app.urllib.request.urlopen", return_value=response):
+                events = list(router.stream_generate(
+                    "main_generation",
+                    [{"role": "user", "content": "test"}],
+                    request_id=322,
+                ))
+        self.assertEqual([item["type"] for item in events], ["delta", "done"])
+        with closing(get_db()) as db:
+            row = db.execute("SELECT * FROM ai_usage_events WHERE request_id=322").fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["attempt_status"], "success")
+        self.assertEqual(row["usage_status"], "incomplete")
+        self.assertEqual(row["cache_status"], "incomplete")
+        self.assertIsNone(row["cache_hit_tokens"])
 
 
 if __name__ == "__main__":

@@ -105,7 +105,7 @@ class UsageNormalisationTests(unittest.TestCase):
         self.assertEqual(row["cache_status"], "available")
         self.assertEqual(row["endpoint"], "https://example.test")
         self.assertNotIn("secret", str(dict(row)))
-        self.assertTrue({"messages", "content", "api_key", "prompt"}isdisjoint(set(row.keys())))
+        self.assertTrue({"messages", "content", "api_key", "prompt"}.isdisjoint(set(row.keys())))
 
 
 if __name__ == "__main__":

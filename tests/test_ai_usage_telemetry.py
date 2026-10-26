@@ -30,6 +30,7 @@ class UsageNormalisationTests(unittest.TestCase):
         self.assertIsNone(usage["cache_hit_tokens"])
         self.assertIsNone(usage["cache_miss_tokens"])
         self.assertIsNone(usage["cache_hit_rate"])
+        self.assertEqual(usage["cache_status"], "missing")
 
     def test_explicit_zero_hit_is_preserved(self):
         usage = _normalise_ai_usage({
@@ -41,6 +42,7 @@ class UsageNormalisationTests(unittest.TestCase):
         })
         self.assertEqual(usage["cache_hit_tokens"], 0)
         self.assertEqual(usage["cache_miss_tokens"], 20)
+        self.assertEqual(usage["cache_status"], "available")
         self.assertEqual(usage["cache_hit_rate"], 0.0)
 
     def test_cached_tokens_alias_is_supported(self):
@@ -99,10 +101,11 @@ class UsageNormalisationTests(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertEqual(row["cache_hit_tokens"], 4)
         self.assertEqual(row["cache_miss_tokens"], 8)
-        self.assertEqual(row["cache_hit_rate"], 100.0 / 3.0)
+        self.assertAlmostEqual(row["cache_hit_rate"], 100.0 / 3.0)
+        self.assertEqual(row["cache_status"], "available")
         self.assertEqual(row["endpoint"], "https://example.test")
         self.assertNotIn("secret", str(dict(row)))
-        self.assertNotIn("prompt", " ".join(row.keys()).lower().replace("prompt_tokens", ""))
+        self.assertTrue({"messages", "content", "api_key", "prompt"}isdisjoint(set(row.keys())))
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from urllib.error import HTTPError
 from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +16,7 @@ os.environ["AI_USAGE_RETENTION_DAYS"] = "30"
 os.environ["AI_STREAM_INCLUDE_USAGE"] = "1"
 
 from backend.app import (  # noqa: E402
+    _ai_error_kind,
     _normalise_ai_usage,
     _record_ai_usage_event,
     _safe_endpoint,
@@ -68,6 +70,11 @@ class UsageNormalisationTests(unittest.TestCase):
         })
         self.assertEqual(usage["cache_hit_tokens"], 0)
         self.assertIsNone(usage["cache_hit_rate"])
+
+    def test_error_reason_is_sanitized_and_http_status_is_kept(self):
+        self.assertEqual(_ai_error_kind(RuntimeError("secret token in provider body")), "RuntimeError")
+        error = HTTPError("https://provider.example.test", 429, "rate limit", {}, None)
+        self.assertEqual(_ai_error_kind(error), "http_429")
 
     def test_endpoint_does_not_store_credentials_or_query(self):
         self.assertEqual(

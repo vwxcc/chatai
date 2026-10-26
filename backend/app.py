@@ -274,6 +274,7 @@ def init_db() -> None:
             streaming INTEGER NOT NULL DEFAULT 0,
             attempt_status TEXT NOT NULL CHECK(attempt_status IN ('success','failed','cancelled')),
             usage_status TEXT NOT NULL CHECK(usage_status IN ('available','missing','parse_error','incomplete')),
+            cache_status TEXT NOT NULL CHECK(cache_status IN ('available','missing','parse_error','incomplete')),
             prompt_tokens INTEGER,
             completion_tokens INTEGER,
             total_tokens INTEGER,
@@ -300,6 +301,9 @@ def init_db() -> None:
         columns = {row["name"] for row in db.execute("PRAGMA table_info(ai_requests)").fetchall()}
         if "cancel_requested" not in columns:
             db.execute("ALTER TABLE ai_requests ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
+        usage_columns = {row["name"] for row in db.execute("PRAGMA table_info(ai_usage_events)").fetchall()}
+        if "cache_status" not in usage_columns:
+            db.execute("ALTER TABLE ai_usage_events ADD COLUMN cache_status TEXT NOT NULL DEFAULT 'missing'")
         db.commit()
 
 def hash_password(password: str) -> str:
@@ -859,6 +863,7 @@ def _usage_nonnegative_int(value):
 def _normalise_ai_usage(usage):
     empty = {
         "usage_status": "missing",
+        "cache_status": "missing",
         "prompt_tokens": None,
         "completion_tokens": None,
         "total_tokens": None,
@@ -869,7 +874,7 @@ def _normalise_ai_usage(usage):
     if usage is None:
         return empty
     if not isinstance(usage, dict):
-        return {**empty, "usage_status": "parse_error"}
+        return {**empty, "usage_status": "parse_error", "cache_status": "parse_error"}
 
     prompt = _usage_nonnegative_int(usage.get("prompt_tokens"))
     completion = _usage_nonnegative_int(usage.get("completion_tokens"))
@@ -886,9 +891,11 @@ def _normalise_ai_usage(usage):
         hit, miss,
     )
     status = "available" if any(value is not None for value in recognized) else "incomplete"
+    cache_status = "available" if hit is not None or miss is not None else "missing"
     hit_rate = (hit / prompt * 100.0) if prompt is not None and prompt > 0 and hit is not None else None
     return {
         "usage_status": status,
+        "cache_status": cache_status,
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "total_tokens": total,
@@ -937,6 +944,8 @@ def _record_ai_usage_event(
         metrics = _normalise_ai_usage(usage)
         if metrics["usage_status"] != "available" and usage_status:
             metrics["usage_status"] = usage_status
+        if metrics["cache_status"] != "available" and usage_status:
+            metrics["cache_status"] = usage_status
         provider = str(model_data.get("provider_name") or "unknown")[:200]
         model_name = str(model_data.get("model_name") or "unknown")[:200]
         response_model_name = str(response_model)[:200] if response_model else None
@@ -951,10 +960,10 @@ def _record_ai_usage_event(
                 """
                 INSERT INTO ai_usage_events (
                     request_id, task_key, routing_set_id, provider, model, response_model,
-                    endpoint, streaming, attempt_status, usage_status, prompt_tokens,
+                    endpoint, streaming, attempt_status, usage_status, cache_status, prompt_tokens,
                     completion_tokens, total_tokens, cache_hit_tokens, cache_miss_tokens,
                     cache_hit_rate, duration_ms, created_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     int(request_id) if request_id is not None else None,
@@ -967,6 +976,7 @@ def _record_ai_usage_event(
                     int(bool(streaming)),
                     status,
                     metrics["usage_status"],
+                    metrics["cache_status"],
                     metrics["prompt_tokens"],
                     metrics["completion_tokens"],
                     metrics["total_tokens"],
@@ -1945,7 +1955,7 @@ def list_ai_usage(request:Request,limit:int=100):
         events=db.execute(
             """
             SELECT id,request_id,task_key,routing_set_id,provider,model,response_model,endpoint,
-                   streaming,attempt_status,usage_status,prompt_tokens,completion_tokens,total_tokens,
+                   streaming,attempt_status,usage_status,cache_status,prompt_tokens,completion_tokens,total_tokens,
                    cache_hit_tokens,cache_miss_tokens,cache_hit_rate,duration_ms,created_at
             FROM ai_usage_events ORDER BY id DESC LIMIT ?
             """,
@@ -1953,13 +1963,13 @@ def list_ai_usage(request:Request,limit:int=100):
         ).fetchall()
         summary=db.execute(
             """
-            SELECT task_key,provider,model,streaming,attempt_status,usage_status,
+            SELECT task_key,provider,model,streaming,attempt_status,usage_status,cache_status,
                    COUNT(*) AS attempts,SUM(prompt_tokens) AS prompt_tokens,
                    SUM(completion_tokens) AS completion_tokens,SUM(total_tokens) AS total_tokens,
                    SUM(cache_hit_tokens) AS cache_hit_tokens,SUM(cache_miss_tokens) AS cache_miss_tokens,
                    SUM(CASE WHEN prompt_tokens>0 AND cache_hit_tokens IS NOT NULL THEN 1 ELSE 0 END) AS cache_rate_samples
             FROM ai_usage_events
-            GROUP BY task_key,provider,model,streaming,attempt_status,usage_status
+            GROUP BY task_key,provider,model,streaming,attempt_status,usage_status,cache_status
             ORDER BY attempts DESC,task_key,provider,model
             """
         ).fetchall()

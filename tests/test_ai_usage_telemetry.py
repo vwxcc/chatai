@@ -146,9 +146,9 @@ class StreamingUsageTests(unittest.TestCase):
 
     def test_stream_usage_only_chunk_is_read_without_fallback(self):
         response = _FakeSSEStream([
-            b'data: {"model":"test-stream-model","choices":[{"delta":{"content":"hello"}}]}\\n',
-            b'data: {"model":"test-stream-model","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":1,"total_tokens":11,"prompt_cache_hit_tokens":6,"prompt_cache_miss_tokens":4}}\\n',
-            b"data: [DONE]\\n",
+            b'data: {"model":"test-stream-model","choices":[{"delta":{"content":"hello"}}]}\n',
+            b'data: {"model":"test-stream-model","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":1,"total_tokens":11,"prompt_cache_hit_tokens":6,"prompt_cache_miss_tokens":4}}\n',
+            b"data: [DONE]\n",
         ])
         router = ModelRouter()
         with patch.object(router, "_models_for_task", return_value=([self._model()], 3)):
@@ -174,7 +174,7 @@ class StreamingUsageTests(unittest.TestCase):
 
     def test_stream_ending_before_final_usage_is_marked_incomplete(self):
         response = _FakeSSEStream([
-            b'data: {"model":"test-stream-model","choices":[{"delta":{"content":"partial"}}]}\\n',
+            b'data: {"model":"test-stream-model","choices":[{"delta":{"content":"partial"}}]}\n',
         ])
         router = ModelRouter()
         with patch.object(router, "_models_for_task", return_value=([self._model()], 3)):
